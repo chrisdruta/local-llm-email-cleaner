@@ -1,0 +1,31 @@
+{
+  "name": "Python uv Claude",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  "mounts": [
+    "source=claude-code-${localWorkspaceFolderBasename}-${devcontainerId},target=/home/vscode/.claude,type=volume"
+  ],
+
+  "remoteUser": "vscode",
+
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "ms-python.python",
+        "charliermarsh.ruff"
+      ]
+    }
+  },
+
+  "postCreateCommand": {
+    "sync-python-deps": "uv sync",
+    "fix-claude-dir": "sudo chown -R vscode:vscode /home/vscode/.claude"
+  }
+}
