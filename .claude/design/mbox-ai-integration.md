@@ -1,3 +1,8 @@
+# Local LLM email box cleaning considerations
+
+> Status: design notes / suggestions from the initial brainstorm. Not
+> binding — the implementation and CLAUDE.md reflect current decisions, and
+> they may deviate from these notes where a better approach exists.
 The best architecture is **not** “let the agent directly chew through the 1 GB MBOX and delete things.” Use a **two-stage, auditable pipeline**:
 
 1. **Parse + index the MBOX locally**
@@ -136,6 +141,13 @@ matches at least one deterministic cleanup rule
 ```
 
 Everything else goes to review.
+
+Amendment (2026-06-07): messages carrying Gmail's own `Spam` label are staged
+`DELETE_CANDIDATE` even when the financial/legal/security keyword rules match
+the subject (scam bait imitates exactly those topics). The suppressed keyword
+hits are still recorded as protection hits, so such messages can never be
+auto-approved — they always require human review. Known-contact protection
+remains absolute.
 
 ## Best deletion interface with Gmail
 

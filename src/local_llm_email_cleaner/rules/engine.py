@@ -1,0 +1,141 @@
+"""Rule evaluation and persistence.
+
+Semantics:
+1. Protection rules run first — a hit forces KEEP and excludes the message
+   from LLM classification and the policy gates. Exception: Gmail's own Spam
+   label overrides the keyword protections (scam bait imitates exactly those
+   subjects) but never known_contact; overridden hits are still recorded, so
+   the gates refuse to auto-approve such messages — human review only.
+2. Candidate rules vote cleanup classes; the most conservative wins
+   (ARCHIVE > DELETE > UNSUBSCRIBE), but every hit is recorded in rule_hits.
+3. No hits at all -> NEEDS_REVIEW, left for the LLM classifier.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from collections import Counter
+from dataclasses import dataclass
+
+from ..models import ACTION_FOR_LABEL, RuleVote, StagedLabel
+from . import patterns
+from .candidate_rules import CANDIDATE_RULES
+from .protection_rules import ABSOLUTE_PROTECTION_RULES, OVERRIDABLE_PROTECTION_RULES
+from .views import MessageView, RuleContext
+
+logger = logging.getLogger(__name__)
+
+# Most conservative outcome first; trumps later entries when several rules fire.
+_CANDIDATE_PRECEDENCE = (
+    StagedLabel.ARCHIVE_CANDIDATE,
+    StagedLabel.DELETE_CANDIDATE,
+    StagedLabel.UNSUBSCRIBE_CANDIDATE,
+)
+
+
+@dataclass(frozen=True)
+class RuleResult:
+    staged_label: StagedLabel
+    category: str | None
+    hits: tuple[RuleVote, ...]
+
+
+def evaluate_message(msg: MessageView, ctx: RuleContext) -> RuleResult:
+    absolute_hits = tuple(
+        v for rule in ABSOLUTE_PROTECTION_RULES if (v := rule(msg, ctx))
+    )
+    keyword_hits = tuple(
+        v for rule in OVERRIDABLE_PROTECTION_RULES if (v := rule(msg, ctx))
+    )
+    spam = bool(msg.labels & patterns.SPAM_LABELS)
+    if absolute_hits or (keyword_hits and not spam):
+        hits = absolute_hits + keyword_hits
+        return RuleResult(StagedLabel.KEEP, hits[0].category, hits)
+
+    # Spam override: keyword protection hits are still recorded below, so the
+    # policy gates can never auto-approve these — they always reach a human.
+    candidate_hits = tuple(v for rule in CANDIDATE_RULES if (v := rule(msg, ctx)))
+    if candidate_hits:
+        for label in _CANDIDATE_PRECEDENCE:
+            winners = [v for v in candidate_hits if v.staged_label == label]
+            if winners:
+                return RuleResult(
+                    label, winners[0].category, keyword_hits + candidate_hits
+                )
+
+    return RuleResult(StagedLabel.NEEDS_REVIEW, None, keyword_hits + candidate_hits)
+
+
+def run_rules(
+    conn: sqlite3.Connection, ctx: RuleContext, reset: bool = False
+) -> Counter:
+    """Evaluate all un-ruled messages; returns counts per staged label."""
+    if reset:
+        conn.execute("DELETE FROM rule_hits")
+        conn.execute(
+            """
+            UPDATE messages SET staged_label=NULL, proposed_action=NULL, ai_category=NULL,
+                   ai_confidence=NULL, ai_reason=NULL, classified_by=NULL
+            WHERE review_status = 'pending'
+            """
+        )
+        conn.commit()
+
+    rows = conn.execute(
+        """
+        SELECT id, from_addr, from_name, subject, labels, has_attachments,
+               date_epoch, list_unsubscribe
+        FROM messages WHERE staged_label IS NULL
+        """
+    ).fetchall()
+
+    counts: Counter = Counter()
+    update_batch: list[tuple] = []
+    hit_batch: list[tuple] = []
+
+    for row in rows:
+        view = MessageView.from_row(row)
+        result = evaluate_message(view, ctx)
+        counts[result.staged_label.value] += 1
+
+        classified_by = (
+            "rules" if result.staged_label != StagedLabel.NEEDS_REVIEW else None
+        )
+        update_batch.append(
+            (
+                result.staged_label.value,
+                ACTION_FOR_LABEL[result.staged_label].value,
+                result.category,
+                classified_by,
+                view.id,
+            )
+        )
+        hit_batch.extend(
+            (view.id, hit.rule_name, hit.rule_kind.value, hit.staged_label.value)
+            for hit in result.hits
+        )
+
+    conn.executemany(
+        """
+        UPDATE messages
+        SET staged_label=?, proposed_action=?, ai_category=?, classified_by=?
+        WHERE id=?
+        """,
+        update_batch,
+    )
+    conn.executemany(
+        "INSERT INTO rule_hits (message_id, rule_name, rule_kind, outcome) VALUES (?, ?, ?, ?)",
+        hit_batch,
+    )
+    conn.commit()
+    logger.info("Rules evaluated %d messages: %s", len(rows), dict(counts))
+    return counts
+
+
+def load_context(conn: sqlite3.Connection, old_cutoff_epoch: int) -> RuleContext:
+    contacts = frozenset(
+        r["address"]
+        for r in conn.execute("SELECT address FROM contacts WHERE is_known=1")
+    )
+    return RuleContext(known_contacts=contacts, old_cutoff_epoch=old_cutoff_epoch)

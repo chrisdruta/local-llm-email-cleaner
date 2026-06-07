@@ -1,3 +1,17 @@
+# --- local-llm-email-cleaner: local data and secrets (never commit) ---
+/data/
+*.mbox
+*.db
+*.db-wal
+*.db-shm
+/secrets/
+credentials.json
+token.json
+# local config (config.example.toml stays tracked)
+config.toml
+# exported action tables
+*.csv
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
