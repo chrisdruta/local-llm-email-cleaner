@@ -1,9 +1,12 @@
 """Batched, resumable LLM classification over the SQLite corpus.
 
-Two populations get an LLM verdict:
-- rule-ambiguous messages (staged NEEDS_REVIEW, untouched by rules), and
+Three populations get an LLM verdict:
+- rule-ambiguous messages (staged NEEDS_REVIEW, untouched by rules);
 - rule-staged DELETE_CANDIDATEs, which need an independent LLM confidence
-  before the auto-trash policy gate may fire.
+  before the auto-trash policy gate may fire; and
+- rule-staged ARCHIVE_CANDIDATEs, for the same second-opinion confidence
+  before auto-archive — the LLM may also escalate one to trash, or pull it
+  back to human review if it disagrees.
 
 Requests are fanned out cfg.llm_concurrency at a time on our own thread
 pool (chain.invoke per message — equivalent to LangChain's batch(), which
@@ -20,6 +23,7 @@ import logging
 import sqlite3
 import time
 from collections import Counter
+from datetime import date
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -48,9 +52,12 @@ FROM messages
 WHERE review_status='pending' AND ai_confidence IS NULL
   AND (
         (staged_label=:needs_review AND classified_by IS NULL)
+        -- Rule-staged delete/archive candidates get an independent LLM verdict
+        -- (a second opinion before the auto-trash/auto-archive gates may fire).
         -- Voice-export delete candidates were decided by the export (backed up
         -- to disk) and must not be sent to the LLM; rule-staged ones still are.
-     OR (staged_label=:delete_candidate AND classified_by IS NOT :voice)
+     OR ((staged_label=:delete_candidate OR staged_label=:archive_candidate)
+         AND classified_by IS NOT :voice)
   )
 ORDER BY id
 """
@@ -148,6 +155,22 @@ def _updates_for(row: sqlite3.Row, result: EmailClassification) -> tuple:
             staged = StagedLabel.NEEDS_REVIEW
             action = ProposedAction.REVIEW
         classified_by = CLASSIFIED_BY_RULES_LLM
+    elif row["staged_label"] == StagedLabel.ARCHIVE_CANDIDATE.value:
+        # Rules staged this for archive; the LLM is a second opinion that may
+        # escalate to trash, agree (archive), or pull it back to review.
+        if result.action == ProposedAction.TRASH.value:
+            # Escalation: hand it to the stricter auto-trash gate, which still
+            # independently enforces age / no-attachments / confidence >= 0.90.
+            staged = StagedLabel.DELETE_CANDIDATE
+            action = ProposedAction.TRASH
+        elif result.action == ProposedAction.ARCHIVE.value:
+            staged = StagedLabel.ARCHIVE_CANDIDATE
+            action = ProposedAction.ARCHIVE
+        else:
+            # keep / review -> conservative: back to human review.
+            staged = StagedLabel.NEEDS_REVIEW
+            action = ProposedAction.REVIEW
+        classified_by = CLASSIFIED_BY_RULES_LLM
     else:
         staged = LABEL_FOR_LLM_ACTION[result.action]
         action = ProposedAction(result.action)
@@ -190,6 +213,7 @@ def classify_messages(
         {
             "needs_review": StagedLabel.NEEDS_REVIEW.value,
             "delete_candidate": StagedLabel.DELETE_CANDIDATE.value,
+            "archive_candidate": StagedLabel.ARCHIVE_CANDIDATE.value,
             "voice": CLASSIFIED_BY_VOICE,
         },
     ).fetchall()
@@ -222,9 +246,10 @@ def classify_messages(
         if progress:
             progress(stats, len(rows))
 
+    today = date.today().isoformat()  # one clock read per run; given to the LLM
     for start in range(0, len(rows), cfg.llm_batch_size):
         chunk = rows[start : start + cfg.llm_batch_size]
-        inputs = [build_inputs(row, cfg.max_body_chars) for row in chunk]
+        inputs = [build_inputs(row, cfg.max_body_chars, today) for row in chunk]
         try:
             _batch_with_retry(
                 chain,

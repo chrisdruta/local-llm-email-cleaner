@@ -70,19 +70,53 @@ def test_delete_candidate_llm_disagreement_demotes_to_review(conn, cfg):
     assert row["classified_by"] == "rules+llm"
 
 
-def test_keep_and_archive_rows_not_selected(conn, cfg):
+def test_keep_rows_not_selected(conn, cfg):
     insert_message(
         conn, staged_label="KEEP", proposed_action="keep", classified_by="rules"
     )
-    insert_message(
-        conn,
+    stats = classifier.classify_messages(conn, cfg, fake_chain())
+    assert stats.processed == 0
+
+
+def archive_candidate(conn, **overrides) -> int:
+    fields = dict(
         staged_label="ARCHIVE_CANDIDATE",
         proposed_action="archive",
         classified_by="rules",
-        rfc_message_id="a@x",
     )
-    stats = classifier.classify_messages(conn, cfg, fake_chain())
-    assert stats.processed == 0
+    fields.update(overrides)
+    return insert_message(conn, **fields)
+
+
+def test_archive_candidate_confirmed_by_llm(conn, cfg):
+    # LLM agrees it's archive-worthy: stays archive, now with a confidence.
+    msg_id = archive_candidate(conn)
+    classifier.classify_messages(conn, cfg, fake_chain(action="archive", confidence=0.85))
+    row = row_of(conn, msg_id)
+    assert row["staged_label"] == "ARCHIVE_CANDIDATE"
+    assert row["proposed_action"] == "archive"
+    assert row["classified_by"] == "rules+llm"
+    assert row["ai_confidence"] == 0.85
+
+
+def test_archive_candidate_escalated_to_trash_by_llm(conn, cfg):
+    # LLM thinks it's outright junk: hand it to the auto-trash gate.
+    msg_id = archive_candidate(conn)
+    classifier.classify_messages(conn, cfg, fake_chain(action="trash", confidence=0.97))
+    row = row_of(conn, msg_id)
+    assert row["staged_label"] == "DELETE_CANDIDATE"
+    assert row["proposed_action"] == "trash"
+    assert row["classified_by"] == "rules+llm"
+
+
+def test_archive_candidate_llm_disagreement_demotes_to_review(conn, cfg):
+    # LLM says keep: conservative -> human review.
+    msg_id = archive_candidate(conn)
+    classifier.classify_messages(conn, cfg, fake_chain(action="keep", confidence=0.7))
+    row = row_of(conn, msg_id)
+    assert row["staged_label"] == "NEEDS_REVIEW"
+    assert row["proposed_action"] == "review"
+    assert row["classified_by"] == "rules+llm"
 
 
 def test_failure_marks_row_for_human_review(conn, cfg, monkeypatch):

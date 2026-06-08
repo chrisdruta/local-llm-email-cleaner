@@ -15,7 +15,9 @@ Auto-archive (laxer, because archiving is reversible and labeled in Gmail):
     AND not from a known contact
     AND not protected
     AND, when the LLM saw it, confidence >= auto_archive_min_confidence
-        (rule-staged archive candidates skip the LLM, so NULL passes)
+        (archive candidates normally get an LLM second opinion in `classify`;
+        a NULL confidence — i.e. classify was not run for it — counts as full
+        confidence, so a threshold > 1 disables this gate)
 
 Everything else stays 'pending' for human review. Re-runnable after tuning
 thresholds without re-running the LLM.
@@ -69,8 +71,9 @@ _ARCHIVE_GATE_SQL = f"""
 UPDATE messages SET review_status='auto_approved', review_note='auto-archive policy gate'
 WHERE review_status='pending'
   AND proposed_action='archive'
-  -- Rule-staged archive candidates never see the LLM: NULL confidence counts
-  -- as full confidence (and a threshold > 1 therefore disables the gate).
+  -- Archive candidates normally get an LLM second opinion in `classify`; a
+  -- NULL confidence (classify not run for it) counts as full confidence, so a
+  -- threshold > 1 disables the gate.
   AND COALESCE(ai_confidence, 1.0) >= :min_confidence
   AND {_NOT_KNOWN_CONTACT}
   AND {_HAS_CANDIDATE_HIT}

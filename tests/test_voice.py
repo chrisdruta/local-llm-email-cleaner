@@ -295,6 +295,7 @@ def test_classifier_skips_voice_delete_candidates(conn, tmp_path):
             {
                 "needs_review": "NEEDS_REVIEW",
                 "delete_candidate": "DELETE_CANDIDATE",
+                "archive_candidate": "ARCHIVE_CANDIDATE",
                 "voice": CLASSIFIED_BY_VOICE,
             },
         )

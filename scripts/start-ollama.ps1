@@ -37,7 +37,7 @@
 #>
 [CmdletBinding()]
 param(
-    [int]$Parallel = 4,
+    [int]$Parallel = 8,
     [string]$KvCacheType = "q8_0"
 )
 

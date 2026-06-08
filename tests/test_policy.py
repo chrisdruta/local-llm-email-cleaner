@@ -123,7 +123,8 @@ def archive_row(conn, *, rule_hit: bool = True, **overrides) -> int:
 
 
 def test_archive_gate_approves_rule_staged_without_llm(conn, cfg):
-    # Rule-staged archive candidates never see the LLM; NULL confidence passes.
+    # Fallback path: if classify was not run, NULL confidence still passes the
+    # gate (the COALESCE-as-full-confidence safety net).
     msg_id = archive_row(conn)
     result = policy.apply_policy(conn, cfg)
     assert result["auto_archived"] == 1

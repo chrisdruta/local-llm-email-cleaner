@@ -187,8 +187,11 @@ mail stays easy to find — and bulk-undo — in Gmail.
    `List-Unsubscribe` newsletters → staged as `DELETE_CANDIDATE` /
    `ARCHIVE_CANDIDATE` / `UNSUBSCRIBE_CANDIDATE`.
 3. **LLM** classifies what rules left ambiguous, and gives an independent
-   second opinion (confidence score) on rule-staged delete candidates. If the
-   LLM disagrees with a delete candidate, the message is demoted to review.
+   second opinion (confidence score) on rule-staged **delete and archive**
+   candidates. If the LLM disagrees with a delete candidate, it's demoted to
+   review. For an archive candidate the LLM may agree (stays archive, with its
+   confidence), **escalate to trash** (handed to the stricter auto-trash gate),
+   or disagree (demoted to review).
 4. **Policy gates** auto-approve:
    - **trash** only when *all* hold: LLM confidence ≥ 0.90, no attachments,
      not a known contact, not protected, older than 12 months, and at least
