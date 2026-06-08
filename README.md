@@ -25,18 +25,22 @@ LLM classifier (LangChain + Ollama) → policy gate → review UI / CSV →
 Gmail API action runner → trash / archive
 ```
 
-Every stage reads/writes the SQLite database, so each one is independently
-re-runnable and resumable (interrupt `classify` freely; it picks up where it
-left off).
-
 ## Setup
+
+One-time, per machine:
 
 ```bash
 uv sync
-uv run email-cleaner init --email you@gmail.com   # writes config.toml, creates data/ + the DB
+uv run email-cleaner init --email you@gmail.com   # writes config.toml, creates data/ + secrets/
 ```
 
-Put your Takeout MBOX at `data/takeout.mbox` (or pass a path to `ingest`).
+`init` writes `config.toml` and makes the `data/` and `secrets/` directories —
+run it once. (It also creates the empty SQLite schema, but you don't need it
+for that: `ingest` creates the DB the same way, so to start over you can just
+delete `data/email.db` and re-run from `ingest`.)
+
+Then put your Takeout MBOX at `data/takeout.mbox` (or pass a path to `ingest`),
+and set up Ollama and Gmail credentials below.
 
 ### Ollama (Windows host + devcontainer)
 
@@ -92,18 +96,44 @@ roughly double the Q4 size, leaving less room for slots — raise `-Parallel`
 
 ## Usage
 
+With [Setup](#setup) done, put your Takeout MBOX at `data/takeout.mbox` (or
+pass a path to `ingest`) and run the pipeline in order:
+
 ```bash
-uv run email-cleaner ingest               # stream-parse the MBOX into SQLite (idempotent)
-uv run email-cleaner rules                # deterministic rules: protect, stage candidates
-uv run email-cleaner classify             # local LLM on ambiguous + delete candidates
-uv run email-cleaner policy               # auto-trash gate (re-runnable after tuning)
-uv run email-cleaner review               # Streamlit UI on :8501 — approve/reject
-uv run email-cleaner export actions.csv   # the approved action table
-uv run email-cleaner apply                # DRY RUN: reconcile against live Gmail, log
-uv run email-cleaner apply --execute      # actually trash/archive approved messages
-uv run email-cleaner status               # pipeline progress counts
-uv run email-cleaner voice-export         # back up Google Voice SMS/calls to disk, then stage for trash
+uv run email-cleaner ingest               # 1. stream-parse the MBOX into SQLite (creates the DB; idempotent)
+uv run email-cleaner rules                # 2. deterministic rules: protect, stage candidates
+uv run email-cleaner voice-export         # 2.5 OPTIONAL: back up Google Voice, stage it for trash
+uv run email-cleaner classify             # 3. local LLM on ambiguous + delete candidates
+uv run email-cleaner policy               # 4. auto-approval gate (re-runnable after tuning)
+uv run email-cleaner review               # 5. Streamlit UI on :8501 — approve/reject
+uv run email-cleaner apply                # 6. DRY RUN: reconcile against live Gmail, log only
+uv run email-cleaner apply --execute      # 7. actually trash/archive approved messages
 ```
+
+`uv run email-cleaner status` prints pipeline progress counts at any point, and
+`uv run email-cleaner export actions.csv` dumps the approved-action table for
+inspection (optional — not on the critical path).
+
+**Why this order** — each stage only consumes what the previous one produced:
+
+- `ingest` must populate the message DB before anything can classify it (and it
+  creates `data/email.db` if it's missing).
+- `rules` runs *before* the LLM on purpose: protection rules pull
+  known-contact / financial / security mail out so the LLM never sees it, and
+  candidate rules stage the easy promos.
+- `voice-export`, if you use it, goes after `rules` but before `classify` — it
+  stages Voice messages and tags them so the classifier skips them.
+- `classify` then only touches what rules left ambiguous (plus a second opinion
+  on delete candidates).
+- `policy` is the *only* place auto-approval happens, so it runs after
+  `classify` has produced confidence scores.
+- `review` → `apply` is the human gate, then the deterministic action runner.
+
+**Re-running** — every stage reads/writes the same SQLite DB, so each is
+independently re-runnable and resumable: interrupt `classify` freely (it picks
+up where it left off), and re-run `policy` after tuning thresholds. For a
+genuinely clean slate, delete `data/email.db` and re-run from `ingest` (which
+recreates it) — you don't need to re-run `init`.
 
 `--limit N` works on `ingest`, `classify`, and `apply` for small trial runs.
 
