@@ -5,7 +5,6 @@ from __future__ import annotations
 from conftest import FRIEND_ADDR
 
 from local_llm_email_cleaner.ingest import contacts, store
-from local_llm_email_cleaner.ingest.headers import parse_epoch_to_age_cutoff
 from local_llm_email_cleaner.models import StagedLabel
 from local_llm_email_cleaner.rules import engine
 from local_llm_email_cleaner.rules.views import MessageView, RuleContext
@@ -19,7 +18,6 @@ def make_view(**overrides) -> MessageView:
         subject="hello",
         labels=frozenset(),
         has_attachments=False,
-        date_epoch=1554112800,
         list_unsubscribe=False,
     )
     defaults.update(overrides)
@@ -27,7 +25,7 @@ def make_view(**overrides) -> MessageView:
 
 
 class TestEvaluateMessage:
-    ctx = RuleContext(known_contacts=frozenset({FRIEND_ADDR}), old_cutoff_epoch=0)
+    ctx = RuleContext(known_contacts=frozenset({FRIEND_ADDR}))
 
     def test_known_contact_protected(self):
         result = engine.evaluate_message(make_view(from_addr=FRIEND_ADDR), self.ctx)
@@ -113,7 +111,7 @@ class TestEvaluateMessage:
 def test_run_rules_end_to_end(conn, mbox_path, cfg):
     store.ingest_mbox(conn, mbox_path)
     contacts.derive_contacts(conn, cfg.user_addresses)
-    ctx = engine.load_context(conn, parse_epoch_to_age_cutoff(cfg.old_after_months))
+    ctx = engine.load_context(conn)
 
     counts = engine.run_rules(conn, ctx)
     assert sum(counts.values()) == 7
@@ -126,7 +124,9 @@ def test_run_rules_end_to_end(conn, mbox_path, cfg):
 
     assert staged("friend-1@example.com") == "KEEP"  # known contact
     assert staged("bank-1@example.com") == "KEEP"  # financial keywords
+    # Promos trash regardless of age (promotional_label -> DELETE_CANDIDATE).
     assert staged("promo-1@example.com") == "DELETE_CANDIDATE"
+    assert staged("promo-2@example.com") == "DELETE_CANDIDATE"
     assert staged("ship-1@example.com") == "DELETE_CANDIDATE"
     assert staged("photos-1@example.com") == "NEEDS_REVIEW"
 
@@ -144,3 +144,53 @@ def test_run_rules_end_to_end(conn, mbox_path, cfg):
 
     # Second run is a no-op (only un-ruled rows are evaluated).
     assert sum(engine.run_rules(conn, ctx).values()) == 0
+
+
+def test_reset_preserves_non_pending_rule_hits(conn, mbox_path):
+    """rules --reset must not orphan approved/applied rows from their hits."""
+    store.ingest_mbox(conn, mbox_path)
+    ctx = engine.load_context(conn)
+    engine.run_rules(conn, ctx)
+
+    approved_id = conn.execute(
+        "SELECT id FROM messages WHERE rfc_message_id='ship-1@example.com'"
+    ).fetchone()[0]
+    conn.execute(
+        "UPDATE messages SET review_status='approved' WHERE id=?", (approved_id,)
+    )
+    conn.commit()
+
+    def hits(message_id: int) -> int:
+        return conn.execute(
+            "SELECT COUNT(*) FROM rule_hits WHERE message_id=?", (message_id,)
+        ).fetchone()[0]
+
+    assert hits(approved_id) > 0
+    pending_id = conn.execute(
+        "SELECT id FROM messages WHERE rfc_message_id='promo-1@example.com'"
+    ).fetchone()[0]
+    assert hits(pending_id) > 0
+
+    engine.run_rules(conn, ctx, reset=True)
+
+    # Approved row keeps its hits and its staging; pending row was recomputed.
+    assert hits(approved_id) > 0
+    assert hits(pending_id) > 0
+    assert (
+        conn.execute(
+            "SELECT staged_label FROM messages WHERE id=?", (approved_id,)
+        ).fetchone()[0]
+        is not None
+    )
+
+
+def test_run_rules_commits_per_chunk(conn, mbox_path, monkeypatch):
+    store.ingest_mbox(conn, mbox_path)
+    ctx = engine.load_context(conn)
+    monkeypatch.setattr(engine, "BATCH_SIZE", 2)
+    counts = engine.run_rules(conn, ctx)
+    assert sum(counts.values()) == 7
+    staged_rows = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE staged_label IS NOT NULL"
+    ).fetchone()[0]
+    assert staged_rows == 7

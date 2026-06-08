@@ -27,7 +27,6 @@ CREATE TABLE IF NOT EXISTS messages (
     to_addr           TEXT,                            -- primary recipient, normalized
     to_all            TEXT,                            -- all To/Cc, comma-joined normalized
     subject           TEXT,
-    snippet           TEXT,
     body_text         TEXT,
     has_attachments   INTEGER NOT NULL DEFAULT 0,
     attachment_names  TEXT,                            -- JSON array of filenames
@@ -94,8 +93,7 @@ CREATE INDEX IF NOT EXISTS idx_rule_hits_name ON rule_hits(rule_name);
 CREATE TABLE IF NOT EXISTS contacts (
     address    TEXT PRIMARY KEY,                        -- normalized lowercase
     domain     TEXT,
-    sent_count INTEGER NOT NULL DEFAULT 0,
-    is_known   INTEGER NOT NULL DEFAULT 1
+    sent_count INTEGER NOT NULL DEFAULT 0
 );
 
 -- Audit log: every Gmail mutation attempt (including dry runs) is recorded.
@@ -105,11 +103,11 @@ CREATE TABLE IF NOT EXISTS actions (
     action           TEXT NOT NULL,                     -- trash | archive
     requested_at     TEXT NOT NULL DEFAULT (datetime('now')),
     dry_run          INTEGER NOT NULL,
-    reconciled       INTEGER NOT NULL DEFAULT 0,
+    reconciled       INTEGER NOT NULL DEFAULT 0,        -- did reconcile confirm the live match
     gmail_api_msgid  TEXT,                              -- live Gmail REST id from reconcile
     match_method     TEXT,                              -- 'rfc822msgid' | 'none'
     match_confirmed  INTEGER NOT NULL DEFAULT 0,
-    status           TEXT NOT NULL,                     -- pending | success | skipped | error
+    status           TEXT NOT NULL,                     -- attempt | success | skipped | error
     http_status      INTEGER,
     error            TEXT,
     completed_at     TEXT

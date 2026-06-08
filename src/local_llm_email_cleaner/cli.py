@@ -10,10 +10,9 @@ from pathlib import Path
 
 import click
 
-from . import db, export, policy
+from . import db, export, policy, voice_export
 from .config import Config, config_file_path, load_config, write_default_config
 from .ingest import contacts, store
-from .ingest.headers import parse_epoch_to_age_cutoff
 from .logging_setup import setup_logging
 from .rules import engine
 
@@ -99,6 +98,16 @@ def ingest(
         n = contacts.derive_contacts(conn, cfg.user_addresses)
         if cfg.user_addresses:
             click.echo(f"Known contacts derived from Sent mail: {n}")
+            if n == 0:
+                click.secho(
+                    "WARNING: user_addresses is set but 0 contacts were derived — "
+                    "the known-contact protection will not fire. Check that the "
+                    "configured addresses match your Sent mail's From addresses "
+                    "(most frequent senders in this mbox):",
+                    fg="yellow",
+                )
+                for addr, count in contacts.suggest_user_addresses(conn):
+                    click.echo(f"  {addr}  ({count} messages)")
         else:
             click.echo("user_addresses is empty — most frequent senders in this mbox:")
             for addr, count in contacts.suggest_user_addresses(conn):
@@ -120,7 +129,7 @@ def ingest(
 def rules(cfg: Config, reset: bool) -> None:
     """Run the deterministic rules engine (always before classify)."""
     conn = db.open_db(cfg.db_path)
-    ctx = engine.load_context(conn, parse_epoch_to_age_cutoff(cfg.old_after_months))
+    ctx = engine.load_context(conn)
     click.echo(f"Evaluating rules ({len(ctx.known_contacts)} known contacts) ...")
     counts = engine.run_rules(conn, ctx, reset=reset)
     for label, n in counts.most_common():
@@ -132,11 +141,14 @@ def rules(cfg: Config, reset: bool) -> None:
 @click.option("--limit", type=int, default=None, help="Classify at most N messages.")
 @click.option("--model", default=None, help="Override the Ollama model tag.")
 @click.option(
-    "--batch-size", type=int, default=None, help="Commit every N classifications."
+    "--batch-size",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Commit every N classifications.",
 )
 @click.option(
     "--concurrency",
-    type=int,
+    type=click.IntRange(min=1),
     default=None,
     help="Requests in flight at once (pair with OLLAMA_NUM_PARALLEL on the host).",
 )
@@ -157,9 +169,9 @@ def classify(
 
     if model:
         cfg = dataclasses.replace(cfg, ollama_model=model)
-    if batch_size:
+    if batch_size is not None:
         cfg = dataclasses.replace(cfg, llm_batch_size=batch_size)
-    if concurrency:
+    if concurrency is not None:
         cfg = dataclasses.replace(cfg, llm_concurrency=concurrency)
 
     chain_mod.check_model_available(cfg)  # fails fast if Ollama is unreachable
@@ -237,6 +249,91 @@ def export_cmd(cfg: Config, out_path: str) -> None:
     n = export.export_actions(conn, out_path)
     click.echo(f"Wrote {n} approved actions to {out_path}")
     conn.close()
+
+
+@cli.command("voice-export")
+@click.option(
+    "--out",
+    "out_dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Output directory (default: [voice].out_dir).",
+)
+@click.option(
+    "--no-trash",
+    is_flag=True,
+    help="Export to disk only; don't stage the messages for trash.",
+)
+@click.option(
+    "--mbox",
+    "mbox_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Source MBOX for recovering attachment bytes (default: the ingested one).",
+)
+@click.option(
+    "--no-attachments",
+    is_flag=True,
+    help="Skip recovering MMS images from the MBOX (text export only).",
+)
+@click.pass_obj
+def voice_export_cmd(
+    cfg: Config,
+    out_dir: str | None,
+    no_trash: bool,
+    mbox_path: str | None,
+    no_attachments: bool,
+) -> None:
+    """Export Google Voice SMS / call logs to disk, then stage them for trash.
+
+    Writes JSONL + per-contact transcripts + a calls CSV, recovers MMS images
+    from the source MBOX, then (unless --no-trash) stages the exported messages
+    DELETE_CANDIDATE for the normal review/apply flow. Re-runnable; the files
+    are rewritten in full each time."""
+    from tqdm import tqdm
+    from tqdm.contrib.logging import logging_redirect_tqdm
+
+    out = Path(out_dir) if out_dir else cfg.voice_out_dir
+    conn = db.open_db(cfg.db_path)
+    # Recovering attachments re-reads the whole source MBOX — the slow part.
+    with tqdm(desc="Scanning MBOX", unit="msg", disable=no_attachments) as bar:
+
+        def progress(scanned: int, total: int) -> None:
+            bar.total = total
+            bar.n = scanned
+            bar.refresh()
+
+        with logging_redirect_tqdm():
+            stats = voice_export.export_voice(
+                conn,
+                out,
+                set_disposition=cfg.voice_trash_after_export and not no_trash,
+                include_attachments=not no_attachments,
+                mbox_path=mbox_path,
+                progress=progress,
+            )
+    conn.close()
+    click.echo(
+        f"Exported {stats.sms} SMS, {stats.calls} calls, {stats.voicemails} "
+        f"voicemails across {stats.contacts} contacts to {stats.out_dir}"
+    )
+    if stats.attachments_saved or stats.attachments_skipped:
+        click.echo(
+            f"Attachments: {stats.attachments_saved} recovered, "
+            f"{stats.attachments_skipped} not recovered"
+            + (
+                f" (source mbox not found: {stats.mbox_path or 'unknown'})"
+                if stats.attachments_skipped and not stats.attachments_saved
+                else ""
+            )
+        )
+    if stats.staged_for_trash:
+        click.echo(
+            f"Staged {stats.staged_for_trash} messages for trash "
+            "(pending review — run `email-cleaner review`, then `apply`)."
+        )
+    elif no_trash or not cfg.voice_trash_after_export:
+        click.echo("Backup only — no messages were staged for trash.")
 
 
 @cli.command()

@@ -14,21 +14,31 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 
+from local_llm_email_cleaner import db
 from local_llm_email_cleaner.config import load_config
-from local_llm_email_cleaner.models import ProposedAction, ReviewStatus, StagedLabel
+from local_llm_email_cleaner.models import (
+    ACTIONABLE_ACTIONS,
+    ProposedAction,
+    ReviewStatus,
+    StagedLabel,
+)
 from local_llm_email_cleaner.review import queries
 
 st.set_page_config(page_title="email-cleaner review", layout="wide")
 
-cfg = load_config()
+
+@st.cache_resource
+def _load_cfg():
+    return load_config()
+
+
+cfg = _load_cfg()
 
 
 def get_conn() -> sqlite3.Connection:
-    # A fresh connection per rerun: cheap, and avoids cross-thread reuse issues.
-    conn = sqlite3.connect(cfg.db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    return conn
+    # A fresh connection per rerun (cheap, avoids cross-thread reuse issues),
+    # configured exactly like every other pipeline stage.
+    return db.connect(cfg.db_path)
 
 
 def set_status(conn: sqlite3.Connection, ids: list[int], status: str) -> int:
@@ -36,8 +46,8 @@ def set_status(conn: sqlite3.Connection, ids: list[int], status: str) -> int:
         return 0
     cur = conn.executemany(
         # Never overwrite rows the runner already applied.
-        "UPDATE messages SET review_status=? WHERE id=? AND review_status != 'applied'",
-        [(status, i) for i in ids],
+        "UPDATE messages SET review_status=? WHERE id=? AND review_status != ?",
+        [(status, i, ReviewStatus.APPLIED.value) for i in ids],
     )
     conn.commit()
     return cur.rowcount
@@ -123,16 +133,16 @@ def message_table_with_actions(
 
     c1, c2, c3, c4 = st.columns(4)
     if c1.button(f"Approve selected ({len(selected_ids)})", key=f"as_{key}"):
-        set_status(conn, selected_ids, "approved")
+        set_status(conn, selected_ids, ReviewStatus.APPROVED.value)
         st.rerun()
     if c2.button(f"Reject selected ({len(selected_ids)})", key=f"rs_{key}"):
-        set_status(conn, selected_ids, "rejected")
+        set_status(conn, selected_ids, ReviewStatus.REJECTED.value)
         st.rerun()
     if c3.button(f"Approve ALL shown ({len(all_ids)})", key=f"aa_{key}"):
-        set_status(conn, all_ids, "approved")
+        set_status(conn, all_ids, ReviewStatus.APPROVED.value)
         st.rerun()
     if c4.button(f"Reject ALL shown ({len(all_ids)})", key=f"ra_{key}"):
-        set_status(conn, all_ids, "rejected")
+        set_status(conn, all_ids, ReviewStatus.REJECTED.value)
         st.rerun()
 
 
@@ -156,8 +166,9 @@ def group_table_with_actions(
     )
     groups = edited.loc[edited["select"], group_col].tolist()
     st.caption(
-        "Bulk actions apply to review_status='pending' messages with the given "
-        "proposed action in the selected groups."
+        "Bulk actions apply to the pending messages shown for the selected "
+        "groups when this page rendered — rows staged afterwards (e.g. by a "
+        "concurrent classify/policy run) are never approved unseen."
     )
 
     def pending_ids(action: str) -> list[int]:
@@ -173,20 +184,35 @@ def group_table_with_actions(
             )
         ]
 
-    for action in ("trash", "archive"):
-        ids = pending_ids(action)
+    for action in ACTIONABLE_ACTIONS:
+        snap_key = f"ga_ids_{key}_{action}"
+        # A button click reruns the whole script, so the click handler runs
+        # one render AFTER the user saw the label. Act on the snapshot from
+        # that render (prev_ids) — a fresh query here would approve rows the
+        # user never saw — while the label shows this render's fresh list,
+        # which becomes the snapshot the next click acts on. The still-pending
+        # guard in update_status_if_pending covers rows that changed state
+        # in between.
+        prev_ids: list[int] = st.session_state.get(snap_key, [])
+        fresh_ids = pending_ids(action)
         approve_col, reject_col = st.columns(2)
         if approve_col.button(
-            f"Approve {action} in selected groups ({len(ids)})",
+            f"Approve {action} in selected groups ({len(fresh_ids)})",
             key=f"ga_{action}_{key}",
         ):
-            set_status(conn, ids, "approved")
+            queries.update_status_if_pending(
+                conn, prev_ids, ReviewStatus.APPROVED.value
+            )
             st.rerun()
         if reject_col.button(
-            f"Reject {action} in selected groups ({len(ids)})", key=f"gr_{action}_{key}"
+            f"Reject {action} in selected groups ({len(fresh_ids)})",
+            key=f"gr_{action}_{key}",
         ):
-            set_status(conn, ids, "rejected")
+            queries.update_status_if_pending(
+                conn, prev_ids, ReviewStatus.REJECTED.value
+            )
             st.rerun()
+        st.session_state[snap_key] = fresh_ids
 
 
 def render_detail(conn: sqlite3.Connection) -> None:
@@ -237,8 +263,8 @@ def main() -> None:
     elif view == "Proposed trash":
         statuses = st.sidebar.multiselect(
             "Review status",
-            ["pending", "auto_approved", "approved", "rejected", "applied", "skipped"],
-            default=["pending"],
+            [s.value for s in ReviewStatus],
+            default=[ReviewStatus.PENDING.value],
         )
         if statuses:
             sql = queries.PROPOSED_TRASH.format(statuses=queries.in_clause(statuses))

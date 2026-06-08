@@ -21,9 +21,9 @@ BATCH_SIZE = 500
 _INSERT_SQL = """
 INSERT OR IGNORE INTO messages (
     gmail_msgid, thread_id, rfc_message_id, labels, date_utc, date_epoch,
-    from_addr, from_name, from_domain, to_addr, to_all, subject, snippet,
+    from_addr, from_name, from_domain, to_addr, to_all, subject,
     body_text, has_attachments, attachment_names, size_bytes, list_unsubscribe
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -51,7 +51,6 @@ def _row(msg: ParsedMessage) -> tuple:
         msg.to_addr,
         msg.to_all,
         msg.subject,
-        msg.snippet,
         msg.body_text,
         int(msg.has_attachments),
         json.dumps(msg.attachment_names),

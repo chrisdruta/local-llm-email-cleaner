@@ -27,7 +27,14 @@ from dataclasses import dataclass, field
 from langchain_core.runnables import Runnable
 
 from ..config import Config
-from ..models import LABEL_FOR_LLM_ACTION, ProposedAction, StagedLabel
+from ..models import (
+    CLASSIFIED_BY_LLM,
+    CLASSIFIED_BY_RULES_LLM,
+    CLASSIFIED_BY_VOICE,
+    LABEL_FOR_LLM_ACTION,
+    ProposedAction,
+    StagedLabel,
+)
 from .prompts import build_inputs
 from .schema import EmailClassification
 
@@ -41,7 +48,9 @@ FROM messages
 WHERE review_status='pending' AND ai_confidence IS NULL
   AND (
         (staged_label=:needs_review AND classified_by IS NULL)
-     OR staged_label=:delete_candidate
+        -- Voice-export delete candidates were decided by the export (backed up
+        -- to disk) and must not be sent to the LLM; rule-staged ones still are.
+     OR (staged_label=:delete_candidate AND classified_by IS NOT :voice)
   )
 ORDER BY id
 """
@@ -131,18 +140,18 @@ def _updates_for(row: sqlite3.Row, result: EmailClassification) -> tuple:
     """Compute the column updates for one classified row."""
     if row["staged_label"] == StagedLabel.DELETE_CANDIDATE.value:
         # Rules already staged this for deletion; the LLM is a second opinion.
-        if result.action == "trash":
+        if result.action == ProposedAction.TRASH.value:
             staged = StagedLabel.DELETE_CANDIDATE
             action = ProposedAction.TRASH
         else:
             # Disagreement -> conservative: back to human review.
             staged = StagedLabel.NEEDS_REVIEW
             action = ProposedAction.REVIEW
-        classified_by = "rules+llm"
+        classified_by = CLASSIFIED_BY_RULES_LLM
     else:
         staged = LABEL_FOR_LLM_ACTION[result.action]
         action = ProposedAction(result.action)
-        classified_by = "llm"
+        classified_by = CLASSIFIED_BY_LLM
     return (
         staged.value,
         action.value,
@@ -161,9 +170,10 @@ SET staged_label=?, proposed_action=?, ai_category=?, ai_confidence=?, ai_reason
 WHERE id=?
 """
 
-_FAILURE_SQL = """
+_FAILURE_SQL = f"""
 UPDATE messages
-SET staged_label=?, proposed_action=?, ai_confidence=0.0, ai_reason=?, classified_by='llm'
+SET staged_label=?, proposed_action=?, ai_confidence=0.0, ai_reason=?,
+    classified_by='{CLASSIFIED_BY_LLM}'
 WHERE id=?
 """
 
@@ -180,6 +190,7 @@ def classify_messages(
         {
             "needs_review": StagedLabel.NEEDS_REVIEW.value,
             "delete_candidate": StagedLabel.DELETE_CANDIDATE.value,
+            "voice": CLASSIFIED_BY_VOICE,
         },
     ).fetchall()
     if limit is not None:

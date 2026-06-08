@@ -25,7 +25,7 @@ token = "secrets/token.json"
 # From inside the devcontainer, the Windows-host Ollama server is reachable via
 # host.docker.internal. Run `ollama list` on the host for the exact model tag.
 url = "http://host.docker.internal:11434"
-model = "gemma3n:e4b"
+model = "gemma4:e4b-it-q8_0"
 max_body_chars = 3000
 batch_size = 100
 request_timeout_s = 180
@@ -35,7 +35,6 @@ request_timeout_s = 180
 concurrency = 4
 
 [rules]
-old_after_months = 24
 # Your own address(es) — used to find Sent mail and derive known contacts.
 user_addresses = [{user_addresses}]
 
@@ -54,6 +53,13 @@ uncertain_confidence_threshold = 0.75
 # Gmail label added to messages the runner archives (created on first use),
 # so they stay easy to find — and bulk-undo — in Gmail. "" disables labeling.
 archive_label = "EmailCleaner/Archived"
+
+[voice]
+# `email-cleaner voice-export` writes Google Voice SMS / call-log backups here.
+out_dir = "data/voice-export"
+# After exporting to disk, stage those messages for trash (still pending — they
+# go through normal review/approval first). Set false to back up only.
+trash_after_export = true
 """
 
 
@@ -72,7 +78,6 @@ class Config:
     llm_concurrency: int
     request_timeout_s: float
     # rules
-    old_after_months: int
     user_addresses: tuple[str, ...]
     # policy
     auto_trash_min_confidence: float
@@ -83,6 +88,9 @@ class Config:
     requests_per_second: float
     uncertain_confidence_threshold: float
     archive_label: str
+    # voice
+    voice_out_dir: Path
+    voice_trash_after_export: bool
 
 
 DEFAULTS = Config(
@@ -91,12 +99,11 @@ DEFAULTS = Config(
     credentials_path=Path("secrets/credentials.json"),
     token_path=Path("secrets/token.json"),
     ollama_url="http://host.docker.internal:11434",
-    ollama_model="gemma3n:e4b",
+    ollama_model="gemma4:e4b-it-q8_0",
     max_body_chars=3000,
     llm_batch_size=100,
     llm_concurrency=4,
     request_timeout_s=180.0,
-    old_after_months=24,
     user_addresses=(),
     auto_trash_min_confidence=0.90,
     auto_trash_min_age_months=12,
@@ -105,6 +112,8 @@ DEFAULTS = Config(
     requests_per_second=5.0,
     uncertain_confidence_threshold=0.75,
     archive_label="EmailCleaner/Archived",
+    voice_out_dir=Path("data/voice-export"),
+    voice_trash_after_export=True,
 )
 
 
@@ -114,6 +123,7 @@ def _from_toml(cfg: Config, data: dict) -> Config:
     rules = data.get("rules", {})
     policy = data.get("policy", {})
     gmail = data.get("gmail", {})
+    voice = data.get("voice", {})
     return replace(
         cfg,
         db_path=Path(paths.get("db", cfg.db_path)),
@@ -126,7 +136,6 @@ def _from_toml(cfg: Config, data: dict) -> Config:
         llm_batch_size=int(ollama.get("batch_size", cfg.llm_batch_size)),
         llm_concurrency=int(ollama.get("concurrency", cfg.llm_concurrency)),
         request_timeout_s=float(ollama.get("request_timeout_s", cfg.request_timeout_s)),
-        old_after_months=int(rules.get("old_after_months", cfg.old_after_months)),
         user_addresses=tuple(
             addr.strip().lower()
             for addr in rules.get("user_addresses", cfg.user_addresses)
@@ -150,6 +159,10 @@ def _from_toml(cfg: Config, data: dict) -> Config:
             )
         ),
         archive_label=str(gmail.get("archive_label", cfg.archive_label)).strip(),
+        voice_out_dir=Path(voice.get("out_dir", cfg.voice_out_dir)),
+        voice_trash_after_export=bool(
+            voice.get("trash_after_export", cfg.voice_trash_after_export)
+        ),
     )
 
 
@@ -163,7 +176,13 @@ def _from_env(cfg: Config) -> Config:
     if "EMAIL_CLEANER_OLLAMA_MODEL" in env:
         updates["ollama_model"] = env["EMAIL_CLEANER_OLLAMA_MODEL"]
     if "EMAIL_CLEANER_OLLAMA_CONCURRENCY" in env:
-        updates["llm_concurrency"] = int(env["EMAIL_CLEANER_OLLAMA_CONCURRENCY"])
+        raw = env["EMAIL_CLEANER_OLLAMA_CONCURRENCY"]
+        try:
+            updates["llm_concurrency"] = int(raw)
+        except ValueError:
+            raise ValueError(
+                f"EMAIL_CLEANER_OLLAMA_CONCURRENCY must be an integer, got {raw!r}"
+            ) from None
     return replace(cfg, **updates) if updates else cfg
 
 

@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from ..models import (
+    ACTIONABLE_ACTIONS,
+    APPROVABLE_STATUSES,
+    LLM_CLASSIFIERS,
+    sql_in_list,
+)
+
 MESSAGE_COLS = """
     id, date_utc, from_addr, from_domain, subject, ai_category, ai_confidence,
     ai_reason, staged_label, proposed_action, review_status, classified_by,
@@ -63,7 +70,7 @@ LIMIT 500
 
 UNCERTAIN = f"""
 SELECT {MESSAGE_COLS} FROM messages
-WHERE classified_by LIKE '%llm%' AND ai_confidence < ?
+WHERE classified_by IN ({sql_in_list(LLM_CLASSIFIERS)}) AND ai_confidence < ?
 ORDER BY ai_confidence ASC
 """
 
@@ -116,14 +123,15 @@ SELECT action, dry_run, status, match_method, match_confirmed, error, requested_
 FROM actions WHERE message_id = ? ORDER BY id DESC
 """
 
-# Export: the approved action table as CSV.
-EXPORT_ACTIONS = """
+# Export: the approved action table as CSV. The WHERE must stay in lockstep
+# with the runner's _SELECT_APPROVED — both build it from the same constants.
+EXPORT_ACTIONS = f"""
 SELECT gmail_msgid AS gmail_message_id, rfc_message_id, proposed_action AS action,
        COALESCE(ai_reason, ai_category, 'rule match') AS reason, ai_confidence AS confidence,
        review_status, from_addr, subject, date_utc
 FROM messages
-WHERE review_status IN ('approved', 'auto_approved')
-  AND proposed_action IN ('trash', 'archive')
+WHERE review_status IN ({sql_in_list(APPROVABLE_STATUSES)})
+  AND proposed_action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
 ORDER BY from_domain, date_epoch
 """
 
@@ -131,3 +139,21 @@ ORDER BY from_domain, date_epoch
 def in_clause(values: list[str]) -> str:
     """Quote a list for an IN (...) clause of trusted, static strings."""
     return ",".join(f"'{v}'" for v in values)
+
+
+def update_status_if_pending(conn, ids: list[int], status: str) -> int:
+    """Set review_status on ids that are STILL pending; returns rows changed.
+
+    Used by the review UI's group bulk actions: combined with acting on a
+    render-time snapshot of ids, the pending guard ensures a row that changed
+    state between render and click (applied, approved elsewhere, skipped)
+    is never silently overwritten.
+    """
+    if not ids:
+        return 0
+    cur = conn.executemany(
+        "UPDATE messages SET review_status=? WHERE id=? AND review_status='pending'",
+        [(status, i) for i in ids],
+    )
+    conn.commit()
+    return cur.rowcount

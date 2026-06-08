@@ -13,7 +13,7 @@ token = "secrets/token.json"
 # From inside the devcontainer, the Windows-host Ollama server is reachable via
 # host.docker.internal. Run `ollama list` on the host for the exact model tag.
 url = "http://host.docker.internal:11434"
-model = "gemma3n:e4b"
+model = "gemma4:e4b-it-q8_0"
 max_body_chars = 3000
 batch_size = 100
 request_timeout_s = 180
@@ -23,7 +23,6 @@ request_timeout_s = 180
 concurrency = 4
 
 [rules]
-old_after_months = 24
 # Your own address(es) — used to find Sent mail and derive known contacts.
 user_addresses = []
 
@@ -42,3 +41,10 @@ uncertain_confidence_threshold = 0.75
 # Gmail label added to messages the runner archives (created on first use),
 # so they stay easy to find — and bulk-undo — in Gmail. "" disables labeling.
 archive_label = "EmailCleaner/Archived"
+
+[voice]
+# `email-cleaner voice-export` writes Google Voice SMS / call-log backups here.
+out_dir = "data/voice-export"
+# After exporting to disk, stage those messages for trash (still pending — they
+# go through normal review/approval first). Set false to back up only.
+trash_after_export = true

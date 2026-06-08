@@ -18,7 +18,7 @@ import sqlite3
 from collections import Counter
 from dataclasses import dataclass
 
-from ..models import ACTION_FOR_LABEL, RuleVote, StagedLabel
+from ..models import ACTION_FOR_LABEL, CLASSIFIED_BY_RULES, RuleVote, StagedLabel
 from . import patterns
 from .candidate_rules import CANDIDATE_RULES
 from .protection_rules import ABSOLUTE_PROTECTION_RULES, OVERRIDABLE_PROTECTION_RULES
@@ -67,12 +67,34 @@ def evaluate_message(msg: MessageView, ctx: RuleContext) -> RuleResult:
     return RuleResult(StagedLabel.NEEDS_REVIEW, None, keyword_hits + candidate_hits)
 
 
+BATCH_SIZE = 500
+
+_UPDATE_SQL = """
+UPDATE messages
+SET staged_label=?, proposed_action=?, ai_category=?, classified_by=?
+WHERE id=?
+"""
+
+_INSERT_HIT_SQL = "INSERT INTO rule_hits (message_id, rule_name, rule_kind, outcome) VALUES (?, ?, ?, ?)"
+
+
 def run_rules(
     conn: sqlite3.Connection, ctx: RuleContext, reset: bool = False
 ) -> Counter:
-    """Evaluate all un-ruled messages; returns counts per staged label."""
+    """Evaluate all un-ruled messages; returns counts per staged label.
+
+    Writes are flushed per BATCH_SIZE chunk (interrupt-safe, like ingest).
+    """
     if reset:
-        conn.execute("DELETE FROM rule_hits")
+        # Only pending rows are re-evaluated below, so only their hits may be
+        # deleted — wiping all rule_hits would permanently orphan approved/
+        # applied rows from the record of why they were staged.
+        conn.execute(
+            """
+            DELETE FROM rule_hits WHERE message_id IN
+                (SELECT id FROM messages WHERE review_status = 'pending')
+            """
+        )
         conn.execute(
             """
             UPDATE messages SET staged_label=NULL, proposed_action=NULL, ai_category=NULL,
@@ -85,7 +107,7 @@ def run_rules(
     rows = conn.execute(
         """
         SELECT id, from_addr, from_name, subject, labels, has_attachments,
-               date_epoch, list_unsubscribe
+               list_unsubscribe
         FROM messages WHERE staged_label IS NULL
         """
     ).fetchall()
@@ -94,13 +116,24 @@ def run_rules(
     update_batch: list[tuple] = []
     hit_batch: list[tuple] = []
 
+    def flush() -> None:
+        if not update_batch:
+            return
+        conn.executemany(_UPDATE_SQL, update_batch)
+        conn.executemany(_INSERT_HIT_SQL, hit_batch)
+        conn.commit()
+        update_batch.clear()
+        hit_batch.clear()
+
     for row in rows:
         view = MessageView.from_row(row)
         result = evaluate_message(view, ctx)
         counts[result.staged_label.value] += 1
 
         classified_by = (
-            "rules" if result.staged_label != StagedLabel.NEEDS_REVIEW else None
+            CLASSIFIED_BY_RULES
+            if result.staged_label != StagedLabel.NEEDS_REVIEW
+            else None
         )
         update_batch.append(
             (
@@ -115,27 +148,16 @@ def run_rules(
             (view.id, hit.rule_name, hit.rule_kind.value, hit.staged_label.value)
             for hit in result.hits
         )
+        if len(update_batch) >= BATCH_SIZE:
+            flush()
 
-    conn.executemany(
-        """
-        UPDATE messages
-        SET staged_label=?, proposed_action=?, ai_category=?, classified_by=?
-        WHERE id=?
-        """,
-        update_batch,
-    )
-    conn.executemany(
-        "INSERT INTO rule_hits (message_id, rule_name, rule_kind, outcome) VALUES (?, ?, ?, ?)",
-        hit_batch,
-    )
-    conn.commit()
+    flush()
     logger.info("Rules evaluated %d messages: %s", len(rows), dict(counts))
     return counts
 
 
-def load_context(conn: sqlite3.Connection, old_cutoff_epoch: int) -> RuleContext:
+def load_context(conn: sqlite3.Connection) -> RuleContext:
     contacts = frozenset(
-        r["address"]
-        for r in conn.execute("SELECT address FROM contacts WHERE is_known=1")
+        r["address"] for r in conn.execute("SELECT address FROM contacts")
     )
-    return RuleContext(known_contacts=contacts, old_cutoff_epoch=old_cutoff_epoch)
+    return RuleContext(known_contacts=contacts)

@@ -159,6 +159,117 @@ def mbox_path(tmp_path: Path) -> Path:
     return path
 
 
+def _write_raw_mbox(path: Path, raw_messages: list[bytes]) -> Path:
+    """Write raw RFC822 byte blobs as an mbox, bypassing EmailMessage's
+    normalization — needed for malformed/encoded fixtures a compliant
+    generator refuses to produce."""
+    with open(path, "wb") as f:
+        for raw in raw_messages:
+            f.write(b"From MAILER-DAEMON Mon Apr  1 10:00:00 2019\n")
+            f.write(raw.rstrip(b"\n") + b"\n\n")
+    return path
+
+
+_EDGE_COMMON = b"To: user@example.com\nDate: Mon, 01 Apr 2019 10:00:00 +0000\n"
+
+EDGE_MESSAGES: list[bytes] = [
+    # 1. RFC2047-encoded subject and display name.
+    (
+        b"From: =?utf-8?q?Ren=C3=A9?= <rene@fr.example>\n"
+        + _EDGE_COMMON
+        + b"Subject: =?utf-8?q?Caf=C3=A9_offre_sp=C3=A9ciale?=\n"
+        b"Message-ID: <rfc2047-1@example.com>\n"
+        b"\nBonjour!\n"
+    ),
+    # 2. HTML-only body (no text/plain alternative).
+    (
+        b"From: promo@htmlonly.example\n" + _EDGE_COMMON + b"Subject: html only promo\n"
+        b"Message-ID: <htmlonly-1@example.com>\n"
+        b'Content-Type: text/html; charset="utf-8"\n'
+        b"\n<html><body><p>Big <b>sale</b> on everything</p></body></html>\n"
+    ),
+    # 3. Nested multipart: mixed( alternative(plain, html), pdf attachment ).
+    (
+        b"From: nested@multi.example\n" + _EDGE_COMMON + b"Subject: nested multipart\n"
+        b"Message-ID: <nested-1@example.com>\n"
+        b'Content-Type: multipart/mixed; boundary="OUTER"\n'
+        b"\n--OUTER\n"
+        b'Content-Type: multipart/alternative; boundary="INNER"\n'
+        b"\n--INNER\n"
+        b'Content-Type: text/plain; charset="utf-8"\n'
+        b"\nnested plain body\n"
+        b"--INNER\n"
+        b'Content-Type: text/html; charset="utf-8"\n'
+        b"\n<p>nested html body</p>\n"
+        b"--INNER--\n"
+        b"--OUTER\n"
+        b"Content-Type: application/pdf\n"
+        b'Content-Disposition: attachment; filename="doc.pdf"\n'
+        b"Content-Transfer-Encoding: base64\n"
+        b"\nJVBERi0=\n"
+        b"--OUTER--\n"
+    ),
+    # 4. Non-UTF8 charset (iso-8859-1) body with a high byte.
+    (
+        b"From: legacy@charset.example\n" + _EDGE_COMMON + b"Subject: latin-1 body\n"
+        b"Message-ID: <latin1-1@example.com>\n"
+        b'Content-Type: text/plain; charset="iso-8859-1"\n'
+        b"Content-Transfer-Encoding: 8bit\n"
+        b"\ncaf\xe9 au lait\n"
+    ),
+    # 5. Bogus charset label -> _decode_part's LookupError fallback.
+    (
+        b"From: bogus@charset.example\n" + _EDGE_COMMON + b"Subject: bogus charset\n"
+        b"Message-ID: <bogus-charset-1@example.com>\n"
+        b'Content-Type: text/plain; charset="not-a-charset"\n'
+        b"\nweird charset body\n"
+    ),
+    # 6. No Message-ID at all, but X-GM-MSGID present.
+    (
+        b"From: noid@example.com\n" + _EDGE_COMMON + b"Subject: missing message id\n"
+        b"X-GM-MSGID: 555000111222333444\n"
+        b"\nno rfc message id here\n"
+    ),
+    # 7. Unclosed <style>: text after it must still be extracted.
+    (
+        b"From: promo@unclosed.example\n"
+        + _EDGE_COMMON
+        + b"Subject: unclosed style promo\n"
+        b"Message-ID: <unclosed-style-1@example.com>\n"
+        b'Content-Type: text/html; charset="utf-8"\n'
+        b'\n<html><head><style type="text/css">.x{color:red}\n'
+        b"</head><body>visible promo text</body></html>\n"
+    ),
+    # 8. text/csv part with a filename but NO Content-Disposition: a real
+    #    attachment that must set has_attachments=1 (auto-trash gate input).
+    (
+        b"From: billing@invoices.example\n" + _EDGE_COMMON + b"Subject: your invoice\n"
+        b"Message-ID: <csv-1@example.com>\n"
+        b'Content-Type: multipart/mixed; boundary="CSVB"\n'
+        b"\n--CSVB\n"
+        b'Content-Type: text/plain; charset="utf-8"\n'
+        b"\ninvoice attached\n"
+        b"--CSVB\n"
+        b'Content-Type: text/csv; name="invoice.csv"\n'
+        b"\nitem,price\nwidget,9.99\n"
+        b"--CSVB--\n"
+    ),
+    # 9. mbox From-quoting: a body line starting with '>From ' must neither
+    #    split the mbox nor lose the line.
+    (
+        b"From: archivist@example.com\n" + _EDGE_COMMON + b"Subject: from-quoted body\n"
+        b"Message-ID: <fromquote-1@example.com>\n"
+        b"\nfirst line\n>From the archive, a quoted line\nlast line\n"
+    ),
+]
+
+
+@pytest.fixture
+def edge_mbox_path(tmp_path: Path) -> Path:
+    """Real-Takeout-shaped edge cases the EmailMessage-built fixture can't express."""
+    return _write_raw_mbox(tmp_path / "edge.mbox", EDGE_MESSAGES)
+
+
 def insert_message(conn: sqlite3.Connection, **overrides) -> int:
     """Insert a messages row with sensible defaults; returns its id."""
     row = {
@@ -174,7 +285,6 @@ def insert_message(conn: sqlite3.Connection, **overrides) -> int:
         "to_addr": USER_ADDR,
         "to_all": USER_ADDR,
         "subject": "test message",
-        "snippet": "body",
         "body_text": "body",
         "has_attachments": 0,
         "attachment_names": "[]",

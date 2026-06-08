@@ -75,11 +75,23 @@ def parse_date(msg: Message) -> tuple[str | None, int | None]:
     return dt.isoformat(), int(dt.timestamp())
 
 
-def parse_message_id(msg: Message) -> str | None:
-    raw = msg.get("Message-ID") or msg.get("Message-Id")
-    if not raw:
+def normalize_msgid(raw: object, *, casefold: bool = False) -> str | None:
+    """Strip whitespace and angle brackets from an RFC 822 Message-ID.
+
+    Case is preserved by default — Message-ID local-parts are case-sensitive
+    and Gmail's rfc822msgid: search matches literally. Pass casefold=True
+    only for case-insensitive *comparison*, never for storage or queries.
+    """
+    if raw is None:
         return None
-    return str(raw).strip().strip("<>").strip() or None
+    value = str(raw).strip().strip("<>").strip()
+    if casefold:
+        value = value.casefold()
+    return value or None
+
+
+def parse_message_id(msg: Message) -> str | None:
+    return normalize_msgid(msg.get("Message-ID") or msg.get("Message-Id"))
 
 
 def parse_gmail_headers(msg: Message) -> tuple[str | None, str | None, str | None]:

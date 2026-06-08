@@ -5,7 +5,7 @@ from __future__ import annotations
 import email
 import logging
 import mailbox
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from email import policy
 from pathlib import Path
 
@@ -38,13 +38,48 @@ def parse_raw_message(raw: bytes) -> ParsedMessage:
         to_addr=recipients[0] if recipients else None,
         to_all=",".join(recipients) if recipients else None,
         subject=headers.decode_str(msg.get("Subject")),
-        snippet=bodies.make_snippet(body_text),
         body_text=body_text,
         has_attachments=has_attachments,
         attachment_names=attachment_names,
         size_bytes=len(raw),
         list_unsubscribe=msg.get("List-Unsubscribe") is not None,
     )
+
+
+def iter_attachments(
+    path: Path | str,
+    wanted_message_ids: set[str],
+    on_scan: Callable[[int, int], None] | None = None,
+) -> Iterator[tuple[str, list[tuple[str, str, bytes]]]]:
+    """Stream the MBOX, yielding (rfc_message_id, attachments) only for messages
+    whose normalized Message-ID is in `wanted_message_ids`.
+
+    Memory stays bounded to one message at a time. Attachment bytes are
+    discarded at ingest, so this re-read is how voice-export recovers them;
+    matching is by Message-ID (the only identifier these messages carry).
+    `on_scan(scanned, total)` fires once per message scanned (for progress)."""
+    if not wanted_message_ids:
+        return
+    box = mailbox.mbox(str(path), create=False)
+    try:
+        total = len(box)  # builds the offset table (the unavoidable full read)
+        for scanned, key in enumerate(box.iterkeys(), 1):
+            if on_scan is not None:
+                on_scan(scanned, total)
+            try:
+                raw = box.get_bytes(key)
+                msg = email.message_from_bytes(raw, policy=policy.compat32)
+                mid = headers.parse_message_id(msg)
+                if mid is None or mid not in wanted_message_ids:
+                    continue
+                yield mid, bodies.extract_attachments(msg)
+            except Exception:
+                logger.warning(
+                    "Skipping unreadable message at mbox key %s", key, exc_info=True
+                )
+                continue
+    finally:
+        box.close()
 
 
 def iter_mbox(path: Path | str, limit: int | None = None) -> Iterator[ParsedMessage]:

@@ -26,6 +26,7 @@ class FakeMessagesApi:
         self.live = live
         self.trashed: list[str] = []
         self.modified: list[tuple[str, dict]] = []
+        self.batch_modified: list[dict] = []
 
     def list(self, userId, q, maxResults):
         rfc_id = q.removeprefix("rfc822msgid:")
@@ -44,6 +45,9 @@ class FakeMessagesApi:
 
     def modify(self, userId, id, body):
         return FakeRequest(lambda: self.modified.append((id, body)) or {"id": id})
+
+    def batchModify(self, userId, body):
+        return FakeRequest(lambda: self.batch_modified.append(body) or {})
 
 
 class FakeLabelsApi:
@@ -142,17 +146,18 @@ def test_execute_trashes_confirmed_match(conn, cfg):
     assert get_status(conn, msg_id) == "applied"
 
 
-def test_execute_archive_removes_inbox_and_adds_label(conn, cfg):
-    approved_message(conn, action="archive")
+def test_execute_archive_batches_inbox_removal_and_label(conn, cfg):
+    msg_id = approved_message(conn, action="archive")
     api = FakeMessagesApi(live_entry("m1@example.com", "G1"))
     labels = FakeLabelsApi()
 
     runner.apply_actions(conn, cfg, FakeService(api, labels), execute=True)
     assert labels.created == [{"id": "Label_1", "name": "EmailCleaner/Archived"}]
-    assert api.modified == [
-        ("G1", {"removeLabelIds": ["INBOX"], "addLabelIds": ["Label_1"]})
+    assert api.batch_modified == [
+        {"ids": ["G1"], "removeLabelIds": ["INBOX"], "addLabelIds": ["Label_1"]}
     ]
-    assert api.trashed == []
+    assert api.trashed == [] and api.modified == []
+    assert get_status(conn, msg_id) == "applied"
 
 
 def test_archive_reuses_existing_label(conn, cfg):
@@ -164,9 +169,9 @@ def test_archive_reuses_existing_label(conn, cfg):
 
     runner.apply_actions(conn, cfg, FakeService(api, labels), execute=True)
     assert labels.created == []  # matched case-insensitively, resolved once
-    assert [body["addLabelIds"] for _, body in api.modified] == [
-        ["Label_7"],
-        ["Label_7"],
+    # Both archives ride a single batchModify call with the shared label.
+    assert api.batch_modified == [
+        {"ids": ["G1", "G2"], "removeLabelIds": ["INBOX"], "addLabelIds": ["Label_7"]}
     ]
 
 
@@ -177,7 +182,7 @@ def test_archive_label_disabled(conn, cfg):
     cfg = dataclasses.replace(cfg, archive_label="")
 
     runner.apply_actions(conn, cfg, FakeService(api, labels), execute=True)
-    assert api.modified == [("G1", {"removeLabelIds": ["INBOX"]})]
+    assert api.batch_modified == [{"ids": ["G1"], "removeLabelIds": ["INBOX"]}]
     assert labels.created == []
 
 
@@ -251,6 +256,158 @@ def test_missing_message_id_skips(conn, cfg):
     stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
     assert stats.skipped == 1
     assert get_status(conn, msg_id) == "skipped"
+
+
+class FakeHttpError(Exception):
+    """Stand-in built the way googleapiclient.errors.HttpError is consumed."""
+
+
+def make_http_error(status=404):
+    from googleapiclient.errors import HttpError
+
+    class Resp(dict):
+        def __init__(self, status):
+            super().__init__({"status": str(status)})
+            self.status = status
+            self.reason = "fake"
+
+    return HttpError(Resp(status), b"fake error")
+
+
+def test_dry_run_unconfirmed_does_not_mutate_review_status(conn, cfg):
+    """A dry run must never change decision state — not even to 'skipped'."""
+    msg_id = approved_message(conn)  # absent from the fake live mailbox
+    api = FakeMessagesApi({})
+
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=False)
+    assert stats.skipped == 1
+    assert get_status(conn, msg_id) == "approved"  # still actionable later
+
+    audit = conn.execute(
+        "SELECT * FROM actions WHERE message_id=?", (msg_id,)
+    ).fetchone()
+    assert audit["status"] == "skipped" and audit["dry_run"] == 1
+
+    # The same run with execute=True DOES take it out of the queue.
+    runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert get_status(conn, msg_id) == "skipped"
+
+
+def test_intent_row_written_before_success(conn, cfg):
+    """Write-intent-then-mark-success: one row, attempt -> success."""
+    msg_id = approved_message(conn)
+    api = FakeMessagesApi(live_entry("m1@example.com", "G1"))
+
+    seen_during_mutation: list[tuple] = []
+    original_trash = api.trash
+
+    def spying_trash(userId, id):
+        # The committed intent row must already exist when Gmail is called.
+        row = conn.execute(
+            "SELECT status, completed_at FROM actions WHERE message_id=?", (msg_id,)
+        ).fetchone()
+        seen_during_mutation.append((row["status"], row["completed_at"]))
+        return original_trash(userId=userId, id=id)
+
+    api.trash = spying_trash
+    runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+
+    assert seen_during_mutation == [("attempt", None)]
+    audit = conn.execute(
+        "SELECT * FROM actions WHERE message_id=?", (msg_id,)
+    ).fetchall()
+    assert len(audit) == 1  # the attempt row is finalized, not duplicated
+    assert audit[0]["status"] == "success"
+    assert audit[0]["completed_at"] is not None
+    assert audit[0]["reconciled"] == 1
+
+
+def test_reconcile_error_records_unreconciled(conn, cfg):
+    msg_id = approved_message(conn)
+    api = FakeMessagesApi(live_entry("m1@example.com", "G1"))
+
+    def exploding_list(userId, q, maxResults):
+        return FakeRequest(lambda: (_ for _ in ()).throw(make_http_error(404)))
+
+    api.list = exploding_list
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert stats.errors == 1
+
+    audit = conn.execute(
+        "SELECT * FROM actions WHERE message_id=?", (msg_id,)
+    ).fetchone()
+    assert audit["status"] == "error"
+    assert audit["reconciled"] == 0  # reconcile never completed
+    assert audit["match_confirmed"] == 0
+    assert get_status(conn, msg_id) == "approved"  # untouched, re-runnable
+
+
+def test_from_mismatch_skips(conn, cfg):
+    msg_id = approved_message(conn)
+    entry = live_entry("m1@example.com", "G1", from_addr="other-sender@evil.example")
+    api = FakeMessagesApi(entry)
+
+    runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert api.trashed == []
+    assert get_status(conn, msg_id) == "skipped"
+
+
+def test_substring_from_no_longer_confirms(conn, cfg):
+    """'noreply@spam.example' inside a different live address must not match."""
+    msg_id = approved_message(conn)
+    entry = live_entry("m1@example.com", "G1", from_addr="xnoreply@spam.example.evil")
+    api = FakeMessagesApi(entry)
+
+    runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert api.trashed == []
+    assert get_status(conn, msg_id) == "skipped"
+
+
+def test_mixed_case_message_id_reconciles(conn, cfg):
+    """The rfc822msgid: query must preserve the stored Message-ID's case."""
+    msg_id = approved_message(conn, rfc_id="AbC123XyZ@Mail.Example")
+    api = FakeMessagesApi(live_entry("AbC123XyZ@Mail.Example", "G1"))
+
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert stats.succeeded == 1
+    assert api.trashed == ["G1"]
+    assert get_status(conn, msg_id) == "applied"
+
+
+def test_failed_archive_batch_marks_chunk_error_and_stays_approved(conn, cfg):
+    m1 = approved_message(conn, rfc_id="m1@example.com", action="archive")
+    m2 = approved_message(conn, rfc_id="m2@example.com", action="archive")
+    live = live_entry("m1@example.com", "G1") | live_entry("m2@example.com", "G2")
+    api = FakeMessagesApi(live)
+
+    def exploding_batch(userId, body):
+        return FakeRequest(lambda: (_ for _ in ()).throw(make_http_error(404)))
+
+    api.batchModify = exploding_batch
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert stats.errors == 2 and stats.succeeded == 0
+
+    for msg_id in (m1, m2):
+        audit = conn.execute(
+            "SELECT * FROM actions WHERE message_id=?", (msg_id,)
+        ).fetchone()
+        assert audit["status"] == "error"
+        assert audit["completed_at"] is not None
+        # review_status untouched -> the chunk is safely re-runnable.
+        assert get_status(conn, msg_id) == "approved"
+
+
+def test_archive_chunking_respects_batch_size(conn, cfg, monkeypatch):
+    monkeypatch.setattr(runner, "ARCHIVE_BATCH_SIZE", 2)
+    live = {}
+    for i in range(1, 4):
+        approved_message(conn, rfc_id=f"m{i}@example.com", action="archive")
+        live |= live_entry(f"m{i}@example.com", f"G{i}")
+    api = FakeMessagesApi(live)
+
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert stats.succeeded == 3
+    assert [b["ids"] for b in api.batch_modified] == [["G1", "G2"], ["G3"]]
 
 
 def test_permanent_delete_never_used():

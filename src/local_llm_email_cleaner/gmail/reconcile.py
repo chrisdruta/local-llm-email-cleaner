@@ -11,6 +11,9 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass
+from email.utils import parseaddr
+
+from ..ingest.headers import normalize_addr, normalize_msgid
 
 logger = logging.getLogger(__name__)
 
@@ -23,19 +26,16 @@ class ReconcileResult:
     detail: str
 
 
-def _normalize_msgid(value: str | None) -> str | None:
-    if not value:
-        return None
-    return value.strip().strip("<>").strip().lower() or None
-
-
 def reconcile_message(service, row: sqlite3.Row, execute_fn) -> ReconcileResult:
     """Resolve a local record to a live Gmail message id, confirming metadata.
 
     `execute_fn` wraps request.execute() with throttling/backoff (runner owns
     rate limiting policy).
     """
-    rfc_id = _normalize_msgid(row["rfc_message_id"])
+    # Preserve the Message-ID's case for the search — local-parts are
+    # case-sensitive and Gmail's rfc822msgid: matches literally. Only the
+    # later equality comparison is casefolded.
+    rfc_id = normalize_msgid(row["rfc_message_id"])
     if rfc_id is None:
         return ReconcileResult(None, "none", False, "no Message-ID in local record")
 
@@ -68,14 +68,17 @@ def reconcile_message(service, row: sqlite3.Row, execute_fn) -> ReconcileResult:
         for h in meta.get("payload", {}).get("headers", [])
     }
 
-    live_msgid = _normalize_msgid(headers.get("message-id"))
-    if live_msgid != rfc_id:
+    live_msgid = normalize_msgid(headers.get("message-id"), casefold=True)
+    if live_msgid != normalize_msgid(rfc_id, casefold=True):
         return ReconcileResult(
             gmail_api_id, "rfc822msgid", False, f"Message-ID mismatch: {live_msgid!r}"
         )
 
+    # Parse the live From mailbox and compare normalized addresses for
+    # equality — substring matching would confirm look-alike senders.
     local_from = row["from_addr"]
-    if local_from and local_from not in (headers.get("from") or "").lower():
+    live_from = normalize_addr(parseaddr(headers.get("from") or "")[1])
+    if local_from and live_from and local_from != live_from:
         return ReconcileResult(
             gmail_api_id,
             "rfc822msgid",

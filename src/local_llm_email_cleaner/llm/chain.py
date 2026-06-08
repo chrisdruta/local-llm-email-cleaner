@@ -58,7 +58,9 @@ def build_classifier_chain(cfg: Config) -> Runnable:
         base_url=cfg.ollama_url,
         model=cfg.ollama_model,
         temperature=0,  # already set — right call for classification
-        num_ctx=8192,  # context window
+        num_ctx=4096,  # context window; prompts run ~1.7k tok (body capped at
+        # max_body_chars + 256 output), so 4096 keeps a 2.4x margin while
+        # halving KV cache vs 8192 — frees VRAM for more parallel slots
         num_predict=256,  # output cap
         keep_alive="10m",  # already set — avoids a ~10s model reload per call
         reasoning=False,  # thinking models would burn num_predict on thinking

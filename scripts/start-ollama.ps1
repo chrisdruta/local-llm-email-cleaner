@@ -8,9 +8,17 @@
     would otherwise respawn the server with default settings — then launches
     `ollama serve` in the foreground with:
 
-        OLLAMA_NUM_PARALLEL    = -Parallel    (default 10)
-        OLLAMA_FLASH_ATTENTION = 1
-        OLLAMA_KV_CACHE_TYPE   = -KvCacheType (default q8_0, halves KV-cache VRAM)
+        OLLAMA_MAX_LOADED_MODELS = 1
+        OLLAMA_CONTEXT_LENGTH    = 4096        (default ctx; the classifier
+                                                client also pins num_ctx=4096)
+        OLLAMA_NUM_PARALLEL      = -Parallel    (default 4)
+        OLLAMA_FLASH_ATTENTION   = 1
+        OLLAMA_KV_CACHE_TYPE     = -KvCacheType (default q8_0, halves KV-cache VRAM)
+
+    KV cache is allocated as num_ctx x num_parallel up front. A q8_0 weight
+    quant (e.g. gemma e4b at q8_0) loads at roughly double the Q4 size, so on
+    a 16 GB card most of the VRAM is weights — raise -Parallel only as far as
+    `ollama ps` still shows 100% GPU.
 
     The variables are set for this process only; nothing is written to your
     system environment. Ctrl+C stops the server — relaunch the Ollama desktop
@@ -29,7 +37,7 @@
 #>
 [CmdletBinding()]
 param(
-    [int]$Parallel = 16,
+    [int]$Parallel = 4,
     [string]$KvCacheType = "q8_0"
 )
 
@@ -58,6 +66,8 @@ if ($listening) {
     Write-Error "Port 11434 is still in use - is another Ollama instance running?"
 }
 
+$env:OLLAMA_MAX_LOADED_MODELS = 1
+$env:OLLAMA_CONTEXT_LENGTH = 4096
 $env:OLLAMA_NUM_PARALLEL = "$Parallel"
 $env:OLLAMA_FLASH_ATTENTION = "1"
 $env:OLLAMA_KV_CACHE_TYPE = $KvCacheType

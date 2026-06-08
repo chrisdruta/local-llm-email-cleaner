@@ -28,44 +28,53 @@ import sqlite3
 
 from .config import Config
 from .ingest.headers import parse_epoch_to_age_cutoff
+from .models import LLM_CLASSIFIERS, sql_in_list
 
 logger = logging.getLogger(__name__)
 
-_GATE_SQL = """
-UPDATE messages SET review_status='auto_approved', review_note='auto-trash policy gate'
-WHERE review_status='pending'
-  AND proposed_action='trash'
-  AND classified_by LIKE '%llm%'
-  AND ai_confidence IS NOT NULL AND ai_confidence >= :min_confidence
-  AND has_attachments = 0
-  AND date_epoch IS NOT NULL AND date_epoch < :age_cutoff
-  AND (from_addr IS NULL OR from_addr NOT IN (SELECT address FROM contacts WHERE is_known=1))
-  AND EXISTS (
+# Safety predicates shared by BOTH gates. Edit here, never in one gate only —
+# the gates must never drift apart on who is excluded from auto-approval.
+_NOT_KNOWN_CONTACT = """
+  (from_addr IS NULL OR from_addr NOT IN (SELECT address FROM contacts))
+"""
+
+_HAS_CANDIDATE_HIT = """
+  EXISTS (
         SELECT 1 FROM rule_hits
         WHERE rule_hits.message_id = messages.id AND rule_hits.rule_kind = 'candidate'
       )
-  AND NOT EXISTS (
+"""
+
+_NOT_PROTECTED = """
+  NOT EXISTS (
         SELECT 1 FROM rule_hits
         WHERE rule_hits.message_id = messages.id AND rule_hits.rule_kind = 'protection'
       )
 """
 
-_ARCHIVE_GATE_SQL = """
+_GATE_SQL = f"""
+UPDATE messages SET review_status='auto_approved', review_note='auto-trash policy gate'
+WHERE review_status='pending'
+  AND proposed_action='trash'
+  AND classified_by IN ({sql_in_list(LLM_CLASSIFIERS)})
+  AND ai_confidence IS NOT NULL AND ai_confidence >= :min_confidence
+  AND has_attachments = 0
+  AND date_epoch IS NOT NULL AND date_epoch < :age_cutoff
+  AND {_NOT_KNOWN_CONTACT}
+  AND {_HAS_CANDIDATE_HIT}
+  AND {_NOT_PROTECTED}
+"""
+
+_ARCHIVE_GATE_SQL = f"""
 UPDATE messages SET review_status='auto_approved', review_note='auto-archive policy gate'
 WHERE review_status='pending'
   AND proposed_action='archive'
   -- Rule-staged archive candidates never see the LLM: NULL confidence counts
   -- as full confidence (and a threshold > 1 therefore disables the gate).
   AND COALESCE(ai_confidence, 1.0) >= :min_confidence
-  AND (from_addr IS NULL OR from_addr NOT IN (SELECT address FROM contacts WHERE is_known=1))
-  AND EXISTS (
-        SELECT 1 FROM rule_hits
-        WHERE rule_hits.message_id = messages.id AND rule_hits.rule_kind = 'candidate'
-      )
-  AND NOT EXISTS (
-        SELECT 1 FROM rule_hits
-        WHERE rule_hits.message_id = messages.id AND rule_hits.rule_kind = 'protection'
-      )
+  AND {_NOT_KNOWN_CONTACT}
+  AND {_HAS_CANDIDATE_HIT}
+  AND {_NOT_PROTECTED}
 """
 
 

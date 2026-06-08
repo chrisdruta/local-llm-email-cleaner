@@ -6,7 +6,7 @@ import sqlite3
 from importlib import resources
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def connect(db_path: Path | str) -> sqlite3.Connection:
@@ -24,7 +24,12 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """Create the schema if missing (idempotent)."""
+    """Create the schema if missing (idempotent); reject version mismatches.
+
+    schema.sql is all CREATE ... IF NOT EXISTS, so re-running it on an
+    existing database never migrates anything — a stored version other than
+    SCHEMA_VERSION means the DB must be rebuilt, not silently reused.
+    """
     ddl = (
         resources.files("local_llm_email_cleaner")
         .joinpath("schema.sql")
@@ -35,6 +40,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     if row is None:
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
+        )
+    elif row["version"] != SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Database schema is v{row['version']} but this code expects "
+            f"v{SCHEMA_VERSION}. Re-run `email-cleaner init` against a fresh "
+            "database (then re-ingest)."
         )
     conn.commit()
 

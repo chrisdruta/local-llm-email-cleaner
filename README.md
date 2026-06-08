@@ -43,7 +43,7 @@ Put your Takeout MBOX at `data/takeout.mbox` (or pass a path to `ingest`).
 Ollama runs on the native Windows host; the devcontainer reaches it at
 `http://host.docker.internal:11434` (the default in `config.toml`). Make sure
 the server is running, then check the exact model tag with `ollama list` on
-the host and set `[ollama].model` accordingly (default: `gemma3n:e4b`-class).
+the host and set `[ollama].model` accordingly (default: `gemma4:e4b-it-q8_0`-class).
 `classify` fails fast with the server's available tags if the model is missing.
 Override per-machine without editing config: `EMAIL_CLEANER_OLLAMA_URL` /
 `EMAIL_CLEANER_OLLAMA_MODEL` / `EMAIL_CLEANER_OLLAMA_CONCURRENCY`.
@@ -58,14 +58,14 @@ repo in a PowerShell window **on the Windows host** (it restarts Ollama with
 the settings below, for that process only):
 
 ```powershell
-.\scripts\start-ollama.ps1                # OLLAMA_NUM_PARALLEL=10
-.\scripts\start-ollama.ps1 -Parallel 16   # match [ollama].concurrency
+.\scripts\start-ollama.ps1                # OLLAMA_NUM_PARALLEL=4 (default)
+.\scripts\start-ollama.ps1 -Parallel 8    # raise it; match [ollama].concurrency
 ```
 
 Equivalently, set these as system environment variables and restart Ollama:
 
 ```
-OLLAMA_NUM_PARALLEL=10      # match [ollama].concurrency
+OLLAMA_NUM_PARALLEL=4       # match [ollama].concurrency
 OLLAMA_FLASH_ATTENTION=1
 OLLAMA_KV_CACHE_TYPE=q8_0   # halves KV-cache VRAM
 ```
@@ -73,7 +73,9 @@ OLLAMA_KV_CACHE_TYPE=q8_0   # halves KV-cache VRAM
 Ollama allocates `num_ctx × num_parallel` of KV cache up front, so watch
 `ollama ps` after the first batch: if the model shows partial CPU offload,
 lower the slot count — spilling weights to CPU costs far more than the
-parallelism gains.
+parallelism gains. A q8_0 *weight* quant (e.g. `gemma…:e4b-it-q8_0`) loads at
+roughly double the Q4 size, leaving less room for slots — raise `-Parallel`
+(and `[ollama].concurrency` to match) only as far as `ollama ps` stays 100% GPU.
 
 ### Gmail API credentials (one-time)
 
@@ -100,9 +102,42 @@ uv run email-cleaner export actions.csv   # the approved action table
 uv run email-cleaner apply                # DRY RUN: reconcile against live Gmail, log
 uv run email-cleaner apply --execute      # actually trash/archive approved messages
 uv run email-cleaner status               # pipeline progress counts
+uv run email-cleaner voice-export         # back up Google Voice SMS/calls to disk, then stage for trash
 ```
 
 `--limit N` works on `ingest`, `classify`, and `apply` for small trial runs.
+
+### Google Voice export
+
+If your mailbox includes Google Voice SMS / call-log emails (labelled `SMS` and
+`Call log`, with the other party as a synthetic `<number>@unknown.email`
+sender), `voice-export` backs them up to disk in a clean, re-importable form and
+then stages them for trash so they leave Gmail:
+
+```bash
+uv run email-cleaner voice-export                 # to [voice].out_dir (default data/voice-export)
+uv run email-cleaner voice-export --out /mnt/backup/voice
+uv run email-cleaner voice-export --no-trash      # back up only, leave Gmail untouched
+uv run email-cleaner voice-export --mbox path.mbox  # explicit source for attachment recovery
+uv run email-cleaner voice-export --no-attachments  # text only, skip image recovery
+```
+
+It writes `sms.jsonl` + `calls.jsonl` (one normalized record per line),
+per-contact transcripts under `sms/<contact>.md`, and a `calls.csv`. SMS
+direction is recovered from the sender (a real-domain From means *you* sent it);
+call direction and duration come from the body.
+
+**Attachments (MMS images):** ingest keeps only attachment *filenames*, not the
+bytes, so voice-export re-reads the source MBOX (located automatically from the
+ingest record, or via `--mbox`) and recovers the images to
+`attachments/<contact>/`, referenced from each record's `attachments` array and
+the transcripts. If the MBOX isn't reachable, text still exports and the
+affected records are flagged `"exported": false`.
+
+Unless `--no-trash`, exported messages are staged `DELETE_CANDIDATE` (still
+`pending` — they go through the normal review/`apply` flow before anything is
+trashed) and tagged so the LLM classifier skips them. The output files are
+rewritten in full on every run, so it's safe to re-run.
 
 Archiving removes the message from the Inbox but keeps it in All Mail, tagged
 with the `EmailCleaner/Archived` label (configurable via `[gmail]
@@ -139,7 +174,15 @@ mail stays easy to find — and bulk-undo — in Gmail.
 
 - `rule_hits` records why each message was staged.
 - `actions` records every Gmail mutation attempt — including dry runs and
-  skips — with the reconciliation evidence.
+  skips — with the reconciliation evidence. Live mutations are
+  write-intent-then-mark-success: an `attempt` row is committed *before* the
+  Gmail call and finalized to `success`/`error` after, so a crash mid-apply
+  leaves a visible `attempt` row (NULL `completed_at`) instead of a silent
+  gap. Dry runs log everything but never change review state.
+- Trash is applied per message (`users.messages.trash`); archives are
+  batched through `users.messages.batchModify` (up to 1000 ids per call). A
+  failed batch marks its chunk `error` and leaves the rows approved, so
+  re-running `apply --execute` retries them.
 
 ## Development
 
