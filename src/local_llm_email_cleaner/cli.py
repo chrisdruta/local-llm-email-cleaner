@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 
 import click
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from . import db, export, policy, voice_export
 from .config import Config, config_file_path, load_config, write_default_config
@@ -81,14 +83,14 @@ def ingest(
 
     conn = db.open_db(cfg.db_path)
     click.echo(f"Ingesting {path} ...")
-    stats = store.ingest_mbox(
-        conn,
-        path,
-        limit=limit,
-        progress=lambda s: click.echo(
-            f"  {s.seen} seen, {s.inserted} inserted", nl=True
-        ),
-    )
+    with tqdm(desc="Ingesting", unit="msg") as bar, logging_redirect_tqdm():
+
+        def progress(s: store.IngestStats) -> None:
+            bar.n = s.seen
+            bar.set_postfix(inserted=s.inserted, skipped=s.skipped)
+            bar.refresh()
+
+        stats = store.ingest_mbox(conn, path, limit=limit, progress=progress)
     click.echo(
         f"Done: {stats.seen} messages seen, {stats.inserted} inserted, "
         f"{stats.skipped} duplicates skipped."
@@ -161,9 +163,6 @@ def classify(
     concurrency: int | None,
 ) -> None:
     """Classify ambiguous + delete-candidate messages with the local LLM."""
-    from tqdm import tqdm
-    from tqdm.contrib.logging import logging_redirect_tqdm
-
     from .llm import chain as chain_mod
     from .llm import classifier
 
@@ -290,11 +289,9 @@ def voice_export_cmd(
     from the source MBOX, then (unless --no-trash) stages the exported messages
     DELETE_CANDIDATE for the normal review/apply flow. Re-runnable; the files
     are rewritten in full each time."""
-    from tqdm import tqdm
-    from tqdm.contrib.logging import logging_redirect_tqdm
-
     out = Path(out_dir) if out_dir else cfg.voice_out_dir
     conn = db.open_db(cfg.db_path)
+    click.echo(f"Exporting Google Voice / SMS to {out} ...")
     # Recovering attachments re-reads the whole source MBOX — the slow part.
     with tqdm(desc="Scanning MBOX", unit="msg", disable=no_attachments) as bar:
 
