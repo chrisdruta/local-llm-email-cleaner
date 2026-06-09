@@ -60,9 +60,9 @@ DIGEST_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# --- subject patterns: protection (never auto-acted) ------------------------
+# --- protection patterns: matched against subject AND body (never auto-acted) -
 
-SECURITY_SUBJECT_RE = re.compile(
+SECURITY_RE = re.compile(
     r"\b(?:security\s+alert|sign[\-\s]?in\s+(?:attempt|detected|from)|new\s+device|"
     r"password\s+(?:was\s+)?(?:changed|reset)|reset\s+your\s+password|"
     r"verification\s+code|one[\-\s]?time\s+(?:pass(?:word|code)?|pin)|\botp\b|"
@@ -70,7 +70,7 @@ SECURITY_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 
-FINANCIAL_LEGAL_MEDICAL_SUBJECT_RE = re.compile(
+FINANCIAL_LEGAL_MEDICAL_RE = re.compile(
     r"\b(?:tax(?:es)?\b|\birs\b|w-?2\b|1099|account\s+statement|bank\s+statement|"
     r"insurance|policy\s+(?:number|renewal|document)|claim\s+(?:status|number)|"
     r"legal|lawyer|attorney|contract|lease|deed|notary|"

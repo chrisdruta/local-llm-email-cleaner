@@ -17,6 +17,9 @@ class MessageView:
     labels: frozenset[str]  # lowercased label names
     has_attachments: bool
     list_unsubscribe: bool
+    #: extracted plain-text body (capped at ingest); protection rules scan it
+    #: so sensitive mail with an innocuous subject is still caught.
+    body_text: str = ""
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> MessageView:
@@ -29,6 +32,7 @@ class MessageView:
             labels=labels,
             has_attachments=bool(row["has_attachments"]),
             list_unsubscribe=bool(row["list_unsubscribe"]),
+            body_text=row["body_text"] or "",
         )
 
 

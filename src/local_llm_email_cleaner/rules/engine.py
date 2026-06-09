@@ -143,56 +143,59 @@ def run_rules(
         )
         conn.commit()
 
-    rows = conn.execute(
-        """
-        SELECT id, from_addr, from_name, subject, labels, has_attachments,
-               list_unsubscribe
-        FROM messages WHERE staged_label IS NULL
-        """
-    ).fetchall()
-
+    # Stream the corpus one BATCH_SIZE chunk at a time. Every evaluated row gets
+    # a non-NULL staged_label and is committed before the next fetch, so it
+    # drops out of `staged_label IS NULL` — memory stays bounded to one chunk
+    # even though we now pull body_text (which protection rules scan).
     counts: Counter = Counter()
-    update_batch: list[tuple] = []
-    hit_batch: list[tuple] = []
+    total = 0
 
-    def flush() -> None:
-        if not update_batch:
-            return
+    while True:
+        rows = conn.execute(
+            """
+            SELECT id, from_addr, from_name, subject, labels, has_attachments,
+                   list_unsubscribe, body_text
+            FROM messages WHERE staged_label IS NULL
+            ORDER BY id LIMIT ?
+            """,
+            (BATCH_SIZE,),
+        ).fetchall()
+        if not rows:
+            break
+
+        update_batch: list[tuple] = []
+        hit_batch: list[tuple] = []
+        for row in rows:
+            view = MessageView.from_row(row)
+            result = evaluate_message(view, ctx)
+            counts[result.staged_label.value] += 1
+
+            classified_by = result.classified_by or (
+                CLASSIFIED_BY_RULES
+                if result.staged_label != StagedLabel.NEEDS_REVIEW
+                else None
+            )
+            update_batch.append(
+                (
+                    result.staged_label.value,
+                    ACTION_FOR_LABEL[result.staged_label].value,
+                    result.category,
+                    classified_by,
+                    int(result.ephemeral),
+                    view.id,
+                )
+            )
+            hit_batch.extend(
+                (view.id, hit.rule_name, hit.rule_kind.value, hit.staged_label.value)
+                for hit in result.hits
+            )
+
         conn.executemany(_UPDATE_SQL, update_batch)
         conn.executemany(_INSERT_HIT_SQL, hit_batch)
         conn.commit()
-        update_batch.clear()
-        hit_batch.clear()
+        total += len(rows)
 
-    for row in rows:
-        view = MessageView.from_row(row)
-        result = evaluate_message(view, ctx)
-        counts[result.staged_label.value] += 1
-
-        classified_by = result.classified_by or (
-            CLASSIFIED_BY_RULES
-            if result.staged_label != StagedLabel.NEEDS_REVIEW
-            else None
-        )
-        update_batch.append(
-            (
-                result.staged_label.value,
-                ACTION_FOR_LABEL[result.staged_label].value,
-                result.category,
-                classified_by,
-                int(result.ephemeral),
-                view.id,
-            )
-        )
-        hit_batch.extend(
-            (view.id, hit.rule_name, hit.rule_kind.value, hit.staged_label.value)
-            for hit in result.hits
-        )
-        if len(update_batch) >= BATCH_SIZE:
-            flush()
-
-    flush()
-    logger.info("Rules evaluated %d messages: %s", len(rows), dict(counts))
+    logger.info("Rules evaluated %d messages: %s", total, dict(counts))
     return counts
 
 

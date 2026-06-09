@@ -176,9 +176,12 @@ def _updates_for(row: sqlite3.Row, result: EmailClassification) -> tuple:
         staged = LABEL_FOR_LLM_ACTION[result.action]
         action = ProposedAction(result.action)
         classified_by = CLASSIFIED_BY_LLM
-    # OR semantics: never clear a deterministically-set ephemeral flag (the
-    # digest rule may have set it during the rules stage); the LLM can only add.
-    ephemeral = bool(row["ephemeral"]) or result.ephemeral
+    # AND semantics: the age-floor waiver requires BOTH signals — the digest
+    # rule must have set ephemeral during the rules stage (deterministic) AND
+    # the LLM must confirm it. A non-digest row (ephemeral=0) can never become
+    # ephemeral from the LLM alone, and a digest the LLM doesn't consider
+    # ephemeral falls back to the normal 12-month floor.
+    ephemeral = bool(row["ephemeral"]) and result.ephemeral
     return (
         staged.value,
         action.value,

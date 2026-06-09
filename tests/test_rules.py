@@ -45,6 +45,31 @@ class TestEvaluateMessage:
         )
         assert result.staged_label == StagedLabel.KEEP
 
+    def test_financial_body_protected_despite_innocuous_subject(self):
+        # The sensitive substance is only in the body; a noreply sender would
+        # otherwise stage this DELETE_CANDIDATE. Body scan -> KEEP.
+        result = engine.evaluate_message(
+            make_view(
+                from_addr="noreply@bank.example",
+                subject="Your monthly update is ready",
+                body_text="Your bank statement for account ending 1234 is now available.",
+            ),
+            self.ctx,
+        )
+        assert result.staged_label == StagedLabel.KEEP
+        assert result.category == "financial_legal_medical"
+
+    def test_security_body_protected_despite_innocuous_subject(self):
+        result = engine.evaluate_message(
+            make_view(
+                from_addr="noreply@service.example",
+                subject="A note for you",
+                body_text="Your verification code is 558213. Do not share it.",
+            ),
+            self.ctx,
+        )
+        assert result.staged_label == StagedLabel.KEEP
+
     def test_protection_beats_candidates(self):
         # A promo from a known contact stays KEEP.
         result = engine.evaluate_message(

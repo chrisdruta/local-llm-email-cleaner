@@ -29,14 +29,21 @@ def known_contact(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
     return None
 
 
+# Protection scans BOTH subject and body: sensitive mail (a bank statement, a
+# lab result) often carries an innocuous subject with the substance only in the
+# body. Body matching deliberately over-protects — when in doubt we KEEP.
 def financial_legal_medical(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
-    if patterns.FINANCIAL_LEGAL_MEDICAL_SUBJECT_RE.search(msg.subject):
+    if patterns.FINANCIAL_LEGAL_MEDICAL_RE.search(msg.subject) or (
+        msg.body_text and patterns.FINANCIAL_LEGAL_MEDICAL_RE.search(msg.body_text)
+    ):
         return _vote("financial_legal_medical", "financial_legal_medical")
     return None
 
 
 def security_alert(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
-    if patterns.SECURITY_SUBJECT_RE.search(msg.subject):
+    if patterns.SECURITY_RE.search(msg.subject) or (
+        msg.body_text and patterns.SECURITY_RE.search(msg.body_text)
+    ):
         return _vote("security_alert", "security")
     if msg.from_addr and patterns.SECURITY_SENDER_RE.search(msg.from_addr):
         return _vote("security_alert", "security")

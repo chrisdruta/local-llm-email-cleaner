@@ -150,9 +150,11 @@ def test_archive_candidate_llm_disagreement_demotes_to_review(conn, cfg):
     assert row["classified_by"] == "rules+llm"
 
 
-def test_llm_sets_ephemeral_flag(conn, cfg):
-    # An archive candidate the LLM judges a timely digest: escalated to trash
-    # AND marked ephemeral so the policy gate may waive the age floor.
+def test_llm_alone_cannot_set_ephemeral(conn, cfg):
+    # The age-floor waiver requires BOTH signals. This row never hit the
+    # deterministic `digest` rule (ephemeral starts 0), so even when the LLM
+    # escalates to trash and claims ephemeral, the flag must stay 0 — the LLM
+    # alone may not waive the 12-month floor.
     msg_id = archive_candidate(conn)
     classifier.classify_messages(
         conn, cfg, fake_chain(action="trash", category="digest", ephemeral=True)
@@ -160,14 +162,34 @@ def test_llm_sets_ephemeral_flag(conn, cfg):
     row = row_of(conn, msg_id)
     assert row["staged_label"] == "DELETE_CANDIDATE"
     assert row["proposed_action"] == "trash"
-    assert row["ephemeral"] == 1
+    assert row["ephemeral"] == 0
 
 
-def test_ephemeral_or_semantics_never_cleared(conn, cfg):
-    # The rules stage already flagged this digest ephemeral; an LLM verdict that
-    # omits ephemeral must NOT clear it.
-    msg_id = archive_candidate(conn, ephemeral=1)
+def test_ephemeral_requires_llm_confirmation(conn, cfg):
+    # The digest rule flagged this ephemeral, but the LLM second opinion does
+    # NOT consider it ephemeral: require-both -> the flag is cleared, so it
+    # falls back to the normal age floor.
+    msg_id = insert_message(
+        conn,
+        staged_label="DELETE_CANDIDATE",
+        proposed_action="trash",
+        classified_by="rules",
+        ephemeral=1,
+    )
     classifier.classify_messages(conn, cfg, fake_chain(action="trash", ephemeral=False))
+    assert row_of(conn, msg_id)["ephemeral"] == 0
+
+
+def test_ephemeral_set_only_when_both_agree(conn, cfg):
+    # Digest rule set ephemeral AND the LLM confirms it -> the waiver applies.
+    msg_id = insert_message(
+        conn,
+        staged_label="DELETE_CANDIDATE",
+        proposed_action="trash",
+        classified_by="rules",
+        ephemeral=1,
+    )
+    classifier.classify_messages(conn, cfg, fake_chain(action="trash", ephemeral=True))
     assert row_of(conn, msg_id)["ephemeral"] == 1
 
 
