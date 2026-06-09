@@ -12,12 +12,15 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 -- One row per MBOX message. SQLite treats NULLs as distinct in UNIQUE
--- constraints, so messages missing an identifier never collide.
+-- constraints, so de-duplication keys off gmail_msgid / rfc_message_id when
+-- present and falls back to dedup_key (a content hash) for the rare message
+-- that carries neither identifier, keeping re-ingest idempotent for those too.
 CREATE TABLE IF NOT EXISTS messages (
     id                INTEGER PRIMARY KEY,
     gmail_msgid       TEXT,                            -- X-GM-MSGID (often absent in Takeout)
     thread_id         TEXT,                            -- X-GM-THRID
     rfc_message_id    TEXT,                            -- RFC 822 Message-ID
+    dedup_key         TEXT,                            -- content hash; set only when both ids are absent
     labels            TEXT,                            -- raw X-Gmail-Labels
     date_utc          TEXT,                            -- ISO-8601 UTC
     date_epoch        INTEGER,                         -- unix seconds, for age filters
@@ -44,7 +47,8 @@ CREATE TABLE IF NOT EXISTS messages (
     review_note       TEXT,
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(gmail_msgid),
-    UNIQUE(rfc_message_id)
+    UNIQUE(rfc_message_id),
+    UNIQUE(dedup_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_from_domain ON messages(from_domain);

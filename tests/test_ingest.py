@@ -192,6 +192,70 @@ def test_from_quoted_body_line_does_not_split(conn, edge_mbox_path):
     assert "last line" in row["body_text"]
 
 
+def _identifierless(subject="Delivery Status Notification (Failure)", **overrides):
+    from local_llm_email_cleaner.models import ParsedMessage
+
+    fields = dict(
+        gmail_msgid=None,
+        thread_id=None,
+        rfc_message_id=None,
+        labels=None,
+        date_utc="2019-04-01T10:00:00+00:00",
+        date_epoch=1554112800,
+        from_addr="mailer-daemon@x.example",
+        from_name=None,
+        from_domain="x.example",
+        to_addr=USER_ADDR,
+        to_all=USER_ADDR,
+        subject=subject,
+        body_text="bounce",
+        has_attachments=False,
+        attachment_names=[],
+        size_bytes=2048,
+        list_unsubscribe=False,
+    )
+    fields.update(overrides)
+    return ParsedMessage(**fields)
+
+
+def test_reingest_dedups_messages_without_any_identifier(conn):
+    # No X-GM-MSGID and no Message-ID: dedup_key keeps re-ingest idempotent.
+    store.insert_messages(conn, [_identifierless()])
+    second = store.insert_messages(conn, [_identifierless()])
+    assert second.inserted == 0
+    n = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE from_addr='mailer-daemon@x.example'"
+    ).fetchone()[0]
+    assert n == 1
+
+
+def test_distinct_identifierless_messages_are_both_kept(conn):
+    # Different content -> different dedup_key -> not collapsed.
+    store.insert_messages(conn, [_identifierless(subject="bounce A")])
+    store.insert_messages(conn, [_identifierless(subject="bounce B")])
+    n = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE from_addr='mailer-daemon@x.example'"
+    ).fetchone()[0]
+    assert n == 2
+
+
+def test_unlabeled_legacy_charset_body_not_mangled(conn):
+    # A text part with no declared charset and a cp1252/latin-1 byte must not be
+    # silently turned into U+FFFD by defaulting to UTF-8.
+    from email import message_from_bytes
+
+    from local_llm_email_cleaner.ingest.bodies import extract_body
+
+    raw = (
+        b"From: x@y.example\nSubject: s\n"
+        b"Content-Type: text/plain\nContent-Transfer-Encoding: 8bit\n"
+        b"\ncaf\xe9 au lait\n"
+    )
+    text, _, _ = extract_body(message_from_bytes(raw))
+    assert "café au lait" in text
+    assert "�" not in text
+
+
 # --- pure-function unit tests -------------------------------------------------
 
 

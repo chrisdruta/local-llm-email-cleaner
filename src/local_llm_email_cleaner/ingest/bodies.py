@@ -63,11 +63,21 @@ def _decode_part(part: Message) -> str | None:
     payload = part.get_payload(decode=True)
     if payload is None:
         return None
-    charset = part.get_content_charset() or "utf-8"
-    try:
-        return payload.decode(charset, errors="replace")
-    except LookupError:  # unknown charset label
-        return payload.decode("utf-8", errors="replace")
+    declared = part.get_content_charset()
+    if declared:
+        try:
+            return payload.decode(declared, errors="replace")
+        except LookupError:  # bogus charset label -> sniff below
+            pass
+    # No (or unusable) charset: try UTF-8 strictly, then cp1252 — the common
+    # legacy Windows encoding — before latin-1, which can't fail. Defaulting
+    # straight to UTF-8 with errors='replace' silently mangles legacy mail.
+    for encoding in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return payload.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return payload.decode("utf-8", errors="replace")
 
 
 def _is_attachment(part: Message) -> bool:

@@ -465,18 +465,20 @@ def page_review(conn: sqlite3.Connection) -> None:
     filters, order = collect_filters()
     sql, params = queries.build_message_query(filters, order=order)
     count_sql, count_params = queries.build_message_count(filters)
-    total = conn.execute(count_sql, count_params).fetchone()[0]
-    df = df_query(conn, sql, params)
-    if total > len(df):
-        st.caption(
-            f"Showing newest {len(df)} of {total} matching messages "
-            f"({queries.BROWSER_LIMIT}-row cap)."
-        )
-    else:
-        st.caption(f"{total} matching messages.")
-
     key = f"review_{_filter_hash(filters, order)}"
+    # The count and row queries carry the user's FTS string (MATCH), so a
+    # malformed search makes THEM raise — they must run inside the handler too,
+    # not just review_browser, or the page crashes instead of showing the error.
     try:
+        total = conn.execute(count_sql, count_params).fetchone()[0]
+        df = df_query(conn, sql, params)
+        if total > len(df):
+            st.caption(
+                f"Showing newest {len(df)} of {total} matching messages "
+                f"({queries.BROWSER_LIMIT}-row cap)."
+            )
+        else:
+            st.caption(f"{total} matching messages.")
         review_browser(conn, df, key=key)
     except (sqlite3.OperationalError, pd.errors.DatabaseError) as exc:
         st.error(f"Bad query (check FTS syntax): {exc}")

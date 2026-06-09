@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -16,14 +17,16 @@ logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 500
 
-# INSERT OR IGNORE -> re-running ingest is idempotent: duplicate gmail_msgid /
-# rfc_message_id rows are silently skipped.
+# INSERT OR IGNORE -> re-running ingest is idempotent: a duplicate gmail_msgid,
+# rfc_message_id, OR dedup_key is silently skipped. dedup_key (a content hash)
+# only carries the load for messages that have neither identifier — without it
+# those would re-insert on every run (NULL ids never collide in UNIQUE).
 _INSERT_SQL = """
 INSERT OR IGNORE INTO messages (
-    gmail_msgid, thread_id, rfc_message_id, labels, date_utc, date_epoch,
+    gmail_msgid, thread_id, rfc_message_id, dedup_key, labels, date_utc, date_epoch,
     from_addr, from_name, from_domain, to_addr, to_all, subject,
     body_text, has_attachments, attachment_names, size_bytes, list_unsubscribe
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -37,11 +40,25 @@ class IngestStats:
         return self.seen - self.inserted
 
 
+def _dedup_key(msg: ParsedMessage) -> str | None:
+    """Stable content hash to de-duplicate messages lacking BOTH identifiers;
+    None (no dedup) when either identifier is present, so id-bearing rows are
+    never collapsed by content."""
+    if msg.gmail_msgid or msg.rfc_message_id:
+        return None
+    basis = "\x00".join(
+        str(part)
+        for part in (msg.from_addr, msg.date_epoch, msg.subject, msg.size_bytes)
+    )
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
 def _row(msg: ParsedMessage) -> tuple:
     return (
         msg.gmail_msgid,
         msg.thread_id,
         msg.rfc_message_id,
+        _dedup_key(msg),
         msg.labels,
         msg.date_utc,
         msg.date_epoch,
