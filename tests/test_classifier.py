@@ -12,6 +12,7 @@ from langchain_core.runnables import RunnableLambda
 
 from conftest import insert_message
 
+from local_llm_email_cleaner.config import DEFAULTS
 from local_llm_email_cleaner.llm import classifier
 from local_llm_email_cleaner.llm.schema import EmailClassification
 
@@ -197,6 +198,58 @@ def test_non_ephemeral_classification_leaves_flag_zero(conn, cfg):
     msg_id = insert_message(conn, staged_label="NEEDS_REVIEW", proposed_action="review")
     classifier.classify_messages(conn, cfg, fake_chain(ephemeral=False))
     assert row_of(conn, msg_id)["ephemeral"] == 0
+
+
+def test_pending_predicate_matches_what_classify_processes(conn, cfg):
+    """status counts the SAME population classify selects: voice excluded,
+    archive candidates included, and it reads 0 after a full run."""
+    from local_llm_email_cleaner import models
+
+    insert_message(conn, staged_label="NEEDS_REVIEW", proposed_action="review")
+    insert_message(
+        conn,
+        staged_label="ARCHIVE_CANDIDATE",
+        proposed_action="archive",
+        classified_by="rules",
+        rfc_message_id="arch@x",
+    )
+    insert_message(
+        conn,
+        staged_label="DELETE_CANDIDATE",
+        proposed_action="trash",
+        classified_by="voice",  # decided by the export -> never sent to the LLM
+        rfc_message_id="voice@x",
+    )
+
+    def pending_count() -> int:
+        return conn.execute(
+            f"SELECT COUNT(*) FROM messages WHERE {models.PENDING_CLASSIFICATION_WHERE}",
+            models.pending_classification_params(),
+        ).fetchone()[0]
+
+    assert pending_count() == 2  # the review + archive rows, NOT the voice row
+    stats = classifier.classify_messages(conn, cfg, fake_chain(action="archive"))
+    assert stats.processed == 2
+    assert pending_count() == 0  # nothing lingers (the voice row never counted)
+
+
+def test_chain_passes_request_timeout(monkeypatch):
+    """request_timeout_s must reach the ollama client, not be silently dropped."""
+    from local_llm_email_cleaner.llm import chain as chain_mod
+
+    captured = {}
+
+    class RecordingOllama:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def with_structured_output(self, *a, **k):
+            return RunnableLambda(lambda x: x)  # coercible for the `prompt | llm` pipe
+
+    monkeypatch.setattr(chain_mod, "ChatOllama", RecordingOllama)
+    cfg = dataclasses.replace(DEFAULTS, request_timeout_s=42.0)
+    chain_mod.build_classifier_chain(cfg)
+    assert captured["client_kwargs"] == {"timeout": 42.0}
 
 
 def test_classification_rejects_unknown_category():

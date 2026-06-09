@@ -75,6 +75,32 @@ CLASSIFIED_BY_VOICE = "voice"
 #: "seen by the LLM" is filtered — equality to 'llm' alone would be a bug)
 LLM_CLASSIFIERS: tuple[str, ...] = (CLASSIFIED_BY_LLM, CLASSIFIED_BY_RULES_LLM)
 
+#: The population the LLM classifier processes: rule-ambiguous rows (NEEDS_REVIEW
+#: with no classification yet) plus rule-staged delete/archive candidates that
+#: still need a second opinion — excluding voice rows (decided by the export,
+#: backed up to disk) and anything already scored. Lives here, not in the
+#: langchain-importing classifier module, so `status` can count the SAME
+#: predicate without paying that import; the two must never drift on what
+#: "awaiting LLM classification" means.
+PENDING_CLASSIFICATION_WHERE = """
+review_status='pending' AND ai_confidence IS NULL
+  AND (
+        (staged_label=:needs_review AND classified_by IS NULL)
+     OR ((staged_label=:delete_candidate OR staged_label=:archive_candidate)
+         AND classified_by IS NOT :voice)
+  )
+"""
+
+
+def pending_classification_params() -> dict[str, str]:
+    """Named-parameter bindings for :data:`PENDING_CLASSIFICATION_WHERE`."""
+    return {
+        "needs_review": StagedLabel.NEEDS_REVIEW.value,
+        "delete_candidate": StagedLabel.DELETE_CANDIDATE.value,
+        "archive_candidate": StagedLabel.ARCHIVE_CANDIDATE.value,
+        "voice": CLASSIFIED_BY_VOICE,
+    }
+
 
 def sql_in_list(values: tuple[str, ...]) -> str:
     """Render code-defined enum values for a SQL ``IN (...)`` clause.

@@ -12,7 +12,7 @@ import click
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
-from . import db, export, policy, voice_export
+from . import db, export, models, policy, voice_export
 from .config import Config, config_file_path, load_config, write_default_config
 from .ingest import contacts, store
 from .logging_setup import setup_logging
@@ -407,10 +407,11 @@ def status(cfg: Config) -> None:
     ):
         click.echo(f"  {row['review_status']:14} {row['a']:8} {row['n']}")
 
+    # Count exactly the population `classify` will process (shared predicate, so
+    # this can't drift): excludes voice rows and includes archive candidates.
     unclassified = conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE review_status='pending' AND ai_confidence IS NULL "
-        "AND (staged_label='NEEDS_REVIEW' AND classified_by IS NULL "
-        "     OR staged_label='DELETE_CANDIDATE')"
+        f"SELECT COUNT(*) FROM messages WHERE {models.PENDING_CLASSIFICATION_WHERE}",
+        models.pending_classification_params(),
     ).fetchone()[0]
     n_contacts = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
     n_actions = conn.execute("SELECT COUNT(*) FROM actions").fetchone()[0]

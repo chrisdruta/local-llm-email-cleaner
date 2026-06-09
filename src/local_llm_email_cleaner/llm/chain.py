@@ -65,6 +65,10 @@ def build_classifier_chain(cfg: Config) -> Runnable:
         keep_alive="10m",  # already set — avoids a ~10s model reload per call
         reasoning=False,  # thinking models would burn num_predict on thinking
         # tokens and return empty content (parse failure)
+        # Per-request timeout on the underlying ollama HTTP client, so a stalled
+        # generation fails (and the classifier retries) instead of hanging a
+        # worker thread forever.
+        client_kwargs={"timeout": cfg.request_timeout_s},
     )
     structured = llm.with_structured_output(EmailClassification, method="json_schema")
     return CLASSIFY_PROMPT | structured

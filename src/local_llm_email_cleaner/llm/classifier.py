@@ -34,10 +34,11 @@ from ..config import Config
 from ..models import (
     CLASSIFIED_BY_LLM,
     CLASSIFIED_BY_RULES_LLM,
-    CLASSIFIED_BY_VOICE,
     LABEL_FOR_LLM_ACTION,
+    PENDING_CLASSIFICATION_WHERE,
     ProposedAction,
     StagedLabel,
+    pending_classification_params,
 )
 from .prompts import build_inputs
 from .schema import EmailClassification
@@ -46,20 +47,15 @@ logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
 
-_SELECT_SQL = """
+# Rule-ambiguous rows plus rule-staged delete/archive candidates needing a
+# second opinion; voice-export delete candidates (decided by the export, backed
+# up to disk) are excluded. The predicate is shared with `status` via models so
+# the two can't drift — see models.PENDING_CLASSIFICATION_WHERE.
+_SELECT_SQL = f"""
 SELECT id, from_addr, from_name, subject, date_utc, labels, body_text, staged_label,
        ephemeral
 FROM messages
-WHERE review_status='pending' AND ai_confidence IS NULL
-  AND (
-        (staged_label=:needs_review AND classified_by IS NULL)
-        -- Rule-staged delete/archive candidates get an independent LLM verdict
-        -- (a second opinion before the auto-trash/auto-archive gates may fire).
-        -- Voice-export delete candidates were decided by the export (backed up
-        -- to disk) and must not be sent to the LLM; rule-staged ones still are.
-     OR ((staged_label=:delete_candidate OR staged_label=:archive_candidate)
-         AND classified_by IS NOT :voice)
-  )
+WHERE {PENDING_CLASSIFICATION_WHERE}
 ORDER BY id
 """
 
@@ -216,15 +212,7 @@ def classify_messages(
     limit: int | None = None,
     progress: Callable[[ClassifyStats, int], None] | None = None,
 ) -> ClassifyStats:
-    rows = conn.execute(
-        _SELECT_SQL,
-        {
-            "needs_review": StagedLabel.NEEDS_REVIEW.value,
-            "delete_candidate": StagedLabel.DELETE_CANDIDATE.value,
-            "archive_candidate": StagedLabel.ARCHIVE_CANDIDATE.value,
-            "voice": CLASSIFIED_BY_VOICE,
-        },
-    ).fetchall()
+    rows = conn.execute(_SELECT_SQL, pending_classification_params()).fetchall()
     if limit is not None:
         rows = rows[:limit]
 
