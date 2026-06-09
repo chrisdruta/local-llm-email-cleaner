@@ -38,13 +38,14 @@ from ..models import (
     ReviewStatus,
     sql_in_list,
 )
-from .reconcile import ReconcileResult, reconcile_message
+from .reconcile import ReconcileResult, reconcile_chunk
 
 logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5
 RETRYABLE_HTTP = {429, 500, 502, 503}
 ARCHIVE_BATCH_SIZE = 1000  # batchModify's documented per-call id limit
+RECONCILE_BATCH_SIZE = 100  # BatchHttpRequest's documented per-call request limit
 
 # Transient network failures from request.execute() that are NOT HttpError
 # (httplib2 raises raw socket/SSL errors on connection drops, timeouts, resets).
@@ -282,12 +283,17 @@ def apply_actions(
         if progress:
             progress(stats)
 
-    for row in rows:
+    def reconciled_rows():
+        # Reconcile a chunk at a time so the metadata gets batch into one HTTP
+        # request; the act loop below is otherwise unchanged.
+        for start in range(0, len(rows), RECONCILE_BATCH_SIZE):
+            chunk = rows[start : start + RECONCILE_BATCH_SIZE]
+            yield from reconcile_chunk(service, chunk, executor)
+
+    for row, rec, rec_err in reconciled_rows():
         stats.examined += 1
         action = row["proposed_action"]
-        try:
-            rec = reconcile_message(service, row, executor)
-        except (HttpError, *RETRYABLE_NETWORK_ERRORS) as err:
+        if rec_err is not None:
             _insert_action(
                 conn,
                 row["id"],
@@ -295,8 +301,8 @@ def apply_actions(
                 not execute,
                 ReconcileResult(None, "none", False, "reconcile failed"),
                 ActionStatus.ERROR.value,
-                _http_status(err),
-                str(err),
+                _http_status(rec_err),
+                str(rec_err),
                 reconciled=False,
             )
             conn.commit()

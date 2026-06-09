@@ -21,6 +21,27 @@ class FakeRequest:
         return self._fn()
 
 
+class FakeBatch:
+    """Emulates googleapiclient's BatchHttpRequest: collected gets fire on
+    execute(), each routed to the callback with (request_id, response, exc)."""
+
+    def __init__(self, callback, log):
+        self._callback = callback
+        self._log = log
+        self._reqs: list[tuple[str, FakeRequest]] = []
+
+    def add(self, request, request_id):
+        self._reqs.append((request_id, request))
+
+    def execute(self):
+        self._log.append(len(self._reqs))  # record sub-request count per batch
+        for request_id, request in self._reqs:
+            try:
+                self._callback(request_id, request.execute(), None)
+            except Exception as exc:  # noqa: BLE001
+                self._callback(request_id, None, exc)
+
+
 class FakeMessagesApi:
     """Emulates service.users().messages() with a dict of live messages."""
 
@@ -96,6 +117,7 @@ class FakeService:
     def __init__(self, messages_api, labels_api=None):
         self._messages = messages_api
         self._labels = labels_api or FakeLabelsApi()
+        self.batches: list[int] = []  # sub-request count of each executed batch
 
     def users(self):
         return self
@@ -105,6 +127,9 @@ class FakeService:
 
     def labels(self):
         return self._labels
+
+    def new_batch_http_request(self, callback):
+        return FakeBatch(callback, self.batches)
 
 
 def live_entry(
@@ -551,6 +576,54 @@ def test_persistent_transient_error_isolated_run_continues(conn, cfg, monkeypatc
     ).fetchone()
     assert audit["status"] == "error"
     assert audit["http_status"] is None  # transient errors carry no HTTP status
+
+
+def test_reconcile_batches_metadata_gets(conn, cfg):
+    """The per-message metadata gets ride a single batched HTTP request."""
+    live = {}
+    for i in range(3):
+        approved_message(conn, rfc_id=f"m{i}@example.com")
+        live |= live_entry(f"m{i}@example.com", f"G{i}")
+    api = FakeMessagesApi(live)
+    svc = FakeService(api)
+
+    stats = runner.apply_actions(conn, cfg, svc, execute=True)
+    assert stats.succeeded == 3
+    assert api.trashed == ["G0", "G1", "G2"]
+    assert svc.batches == [3]  # one batch carrying all three metadata gets
+
+
+def test_reconcile_chunks_respect_batch_limit(conn, cfg, monkeypatch):
+    monkeypatch.setattr(runner, "RECONCILE_BATCH_SIZE", 2)
+    live = {}
+    for i in range(3):
+        approved_message(conn, rfc_id=f"m{i}@example.com")
+        live |= live_entry(f"m{i}@example.com", f"G{i}")
+    svc = FakeService(FakeMessagesApi(live))
+
+    stats = runner.apply_actions(conn, cfg, svc, execute=True)
+    assert stats.succeeded == 3
+    assert svc.batches == [2, 1]  # two reconcile chunks -> two batched gets
+
+
+def test_batched_get_failure_records_error_not_skip(conn, cfg):
+    """A metadata get that fails inside the batch must record a re-runnable
+    error (review_status stays approved), never a silent skip."""
+    msg_id = approved_message(conn)
+    api = FakeMessagesApi(live_entry("m1@example.com", "G1"))
+
+    def exploding_get(userId, id, format, metadataHeaders):
+        return FakeRequest(lambda: (_ for _ in ()).throw(make_http_error(500)))
+
+    api.get = exploding_get
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert stats.errors == 1 and api.trashed == []
+    assert get_status(conn, msg_id) == "approved"  # re-runnable, not skipped
+
+    audit = conn.execute(
+        "SELECT status, reconciled FROM actions WHERE message_id=?", (msg_id,)
+    ).fetchone()
+    assert audit["status"] == "error" and audit["reconciled"] == 0
 
 
 def test_permanent_delete_never_used():
