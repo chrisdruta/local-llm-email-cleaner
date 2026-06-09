@@ -86,10 +86,11 @@ def evaluate_message(msg: MessageView, ctx: RuleContext) -> RuleResult:
     # also hits updates_label -> ARCHIVE) and is marked ephemeral, letting the
     # policy gate auto-trash it without the usual age floor. The LLM still gets
     # the final say in `classify` (DELETE_CANDIDATEs are second-opinioned).
-    if any(v.rule_name == "digest" for v in candidate_hits):
+    digest_hit = next((v for v in candidate_hits if v.rule_name == "digest"), None)
+    if digest_hit is not None:
         return RuleResult(
             StagedLabel.DELETE_CANDIDATE,
-            "digest",
+            digest_hit.category,
             keyword_hits + candidate_hits,
             ephemeral=True,
         )

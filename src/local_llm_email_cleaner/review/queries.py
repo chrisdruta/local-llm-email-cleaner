@@ -15,18 +15,6 @@ MESSAGE_COLS = """
     size_bytes, has_attachments
 """
 
-PROPOSED_TRASH = f"""
-SELECT {MESSAGE_COLS} FROM messages
-WHERE proposed_action='trash' AND review_status IN ({{statuses}})
-ORDER BY from_domain, date_epoch
-"""
-
-AUTO_APPROVED = f"""
-SELECT {MESSAGE_COLS} FROM messages
-WHERE review_status='auto_approved'
-ORDER BY from_domain, date_epoch
-"""
-
 BY_SENDER = """
 SELECT from_addr, COUNT(*) AS messages,
        SUM(CASE WHEN proposed_action='trash' THEN 1 ELSE 0 END) AS proposed_trash,
@@ -61,49 +49,9 @@ ORDER BY SUM(size_bytes) DESC
 LIMIT 100
 """
 
-OLDEST_PROMOS = f"""
-SELECT {MESSAGE_COLS} FROM messages
-WHERE staged_label IN ('DELETE_CANDIDATE', 'UNSUBSCRIBE_CANDIDATE')
-ORDER BY date_epoch ASC
-LIMIT 500
-"""
-
-UNCERTAIN = f"""
-SELECT {MESSAGE_COLS} FROM messages
-WHERE classified_by IN ({sql_in_list(LLM_CLASSIFIERS)}) AND ai_confidence < ?
-ORDER BY ai_confidence ASC
-"""
-
-FTS_SEARCH = f"""
-SELECT {MESSAGE_COLS} FROM messages
-WHERE id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)
-ORDER BY date_epoch DESC
-LIMIT 500
-"""
-
 STATUS_COUNTS = """
 SELECT review_status, proposed_action, COUNT(*) AS n
 FROM messages GROUP BY review_status, proposed_action ORDER BY n DESC
-"""
-
-# Browse messages filtered by status/action or staged label; a NULL named
-# param disables that filter.
-BY_STATUS_WHERE = """
-WHERE (:status IS NULL OR review_status = :status)
-  AND (:action IS NULL OR proposed_action = :action)
-  AND (:label IS NULL OR staged_label = :label)
-"""
-
-BY_STATUS = f"""
-SELECT {MESSAGE_COLS} FROM messages
-{BY_STATUS_WHERE}
-ORDER BY date_epoch DESC
-LIMIT 500
-"""
-
-BY_STATUS_COUNT = f"""
-SELECT COUNT(*) FROM messages
-{BY_STATUS_WHERE}
 """
 
 STAGED_COUNTS = """
@@ -136,9 +84,95 @@ ORDER BY from_domain, date_epoch
 """
 
 
-def in_clause(values: list[str]) -> str:
-    """Quote a list for an IN (...) clause of trusted, static strings."""
-    return ",".join(f"'{v}'" for v in values)
+# Unified-browser query builder. Composes a WHERE from any combination of
+# filters. Stable, deterministic ORDER (id tie-break) so st.dataframe positional
+# row selection stays in sync across reruns.
+_BROWSER_ORDER_DEFAULT = "date_epoch DESC, id DESC"
+_BROWSER_ORDER_OLDEST = "date_epoch ASC, id ASC"
+BROWSER_LIMIT = 500
+
+
+def _message_where(filters: dict) -> tuple[str, list]:
+    """Build a parameterized WHERE for `messages` from a filter dict.
+
+    Every user-supplied value is BOUND (appended to ``params``); only ``?``
+    placeholder counts and the hard-coded column-name literals below are ever
+    interpolated — never a user string. An absent/empty filter key contributes
+    no clause (mirrors the old BY_STATUS NULL-disables convention).
+
+    Recognized keys (all optional):
+        fts             : str        -> messages_fts MATCH
+        review_status   : list[str]  -> review_status IN (...)
+        proposed_action : list[str]  -> proposed_action IN (...)
+        staged_label    : list[str]  -> staged_label IN (...)
+        ai_category     : list[str]  -> ai_category IN (...)
+        conf_lo, conf_hi: float      -> LLM-classified AND ai_confidence >=/<= ?
+        from_addr       : str        -> from_addr LIKE %term%
+        from_domain     : str        -> from_domain LIKE %term%
+        has_attachments : bool       -> has_attachments = 1 (only when True)
+    """
+    where: list[str] = []
+    params: list = []
+
+    fts = (filters.get("fts") or "").strip()
+    if fts:
+        where.append(
+            "id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)"
+        )
+        params.append(fts)
+
+    def _in(col: str, values) -> None:
+        # col is a hard-coded literal from the call sites below — never user input.
+        values = list(values or [])
+        if values:
+            where.append(f"{col} IN ({','.join('?' for _ in values)})")
+            params.extend(values)
+
+    _in("review_status", filters.get("review_status"))
+    _in("proposed_action", filters.get("proposed_action"))
+    _in("staged_label", filters.get("staged_label"))
+    _in("ai_category", filters.get("ai_category"))
+
+    lo, hi = filters.get("conf_lo"), filters.get("conf_hi")
+    if lo is not None or hi is not None:
+        # Confidence is only meaningful for LLM-classified rows.
+        where.append(f"classified_by IN ({sql_in_list(LLM_CLASSIFIERS)})")
+        if lo is not None:
+            where.append("ai_confidence >= ?")
+            params.append(lo)
+        if hi is not None:
+            where.append("ai_confidence <= ?")
+            params.append(hi)
+
+    for col in ("from_addr", "from_domain"):
+        term = (filters.get(col) or "").strip()
+        if term:
+            where.append(f"{col} LIKE ?")
+            params.append(f"%{term}%")
+
+    if filters.get("has_attachments"):
+        where.append("has_attachments = 1")
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    return where_sql, params
+
+
+def build_message_query(filters: dict, order: str = "default") -> tuple[str, list]:
+    """Row query for the unified browser: (sql, params). ``order`` is an
+    allowlist of 'default' (newest first) or 'oldest' (oldest first)."""
+    where_sql, params = _message_where(filters)
+    order_sql = _BROWSER_ORDER_OLDEST if order == "oldest" else _BROWSER_ORDER_DEFAULT
+    sql = (
+        f"SELECT {MESSAGE_COLS} FROM messages {where_sql} "
+        f"ORDER BY {order_sql} LIMIT {BROWSER_LIMIT}"
+    )
+    return sql, params
+
+
+def build_message_count(filters: dict) -> tuple[str, list]:
+    """Total matching rows (same WHERE as build_message_query, no LIMIT)."""
+    where_sql, params = _message_where(filters)
+    return f"SELECT COUNT(*) FROM messages {where_sql}", params
 
 
 def update_status_if_pending(conn, ids: list[int], status: str) -> int:

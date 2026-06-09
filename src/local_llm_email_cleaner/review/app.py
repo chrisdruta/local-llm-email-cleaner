@@ -5,10 +5,16 @@ or directly: `uv run streamlit run src/local_llm_email_cleaner/review/app.py`.
 
 This app only ever writes messages.review_status / review_note — it never
 touches Gmail.
+
+Layout: three pages (Review / Senders / Overview). The Review page is a single
+unified browser — every filter is combinable, and clicking a row opens the
+full email body in a detail panel below the table.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 
 import pandas as pd
@@ -18,6 +24,7 @@ from local_llm_email_cleaner import db, export
 from local_llm_email_cleaner.config import load_config
 from local_llm_email_cleaner.models import (
     ACTIONABLE_ACTIONS,
+    CATEGORIES,
     ProposedAction,
     ReviewStatus,
     StagedLabel,
@@ -54,7 +61,7 @@ def set_status(conn: sqlite3.Connection, ids: list[int], status: str) -> int:
 
 
 def df_query(
-    conn: sqlite3.Connection, sql: str, params: tuple | dict = ()
+    conn: sqlite3.Connection, sql: str, params: tuple | list | dict = ()
 ) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn, params=params)
 
@@ -72,10 +79,10 @@ def sanitized_csv(df: pd.DataFrame) -> bytes:
     return safe.to_csv(index=False).encode("utf-8")
 
 
-#: Message-table display: important columns first; short labels and sized
-#: columns. Subject/reason are wide so they wrap when multiline rows are on.
+#: Message-grid display: important columns first; short labels and sized
+#: columns. The long ai_reason is intentionally NOT in the grid — it lives in
+#: the detail panel so the table stays scannable.
 MESSAGE_COLUMN_ORDER = [
-    "select",
     "id",
     "date_utc",
     "from_addr",
@@ -85,15 +92,13 @@ MESSAGE_COLUMN_ORDER = [
     "review_status",
     "ai_category",
     "ai_confidence",
-    "ai_reason",
     "from_domain",
     "classified_by",
     "size_bytes",
     "has_attachments",
 ]
 MESSAGE_COLUMN_CONFIG = {
-    "select": st.column_config.CheckboxColumn("select", width="small", pinned=True),
-    "id": st.column_config.NumberColumn("id", width="small", pinned=True),
+    "id": st.column_config.NumberColumn("id", width="small"),
     "date_utc": st.column_config.DatetimeColumn(
         "date", format="YYYY-MM-DD", width="small"
     ),
@@ -104,45 +109,186 @@ MESSAGE_COLUMN_CONFIG = {
     "review_status": st.column_config.TextColumn("status", width="small"),
     "ai_category": st.column_config.TextColumn("category", width="small"),
     "ai_confidence": st.column_config.NumberColumn("conf", format="%.2f", width=60),
-    "ai_reason": st.column_config.TextColumn("reason", width="large"),
     "from_domain": st.column_config.TextColumn("domain", width="small"),
     "classified_by": st.column_config.TextColumn("by", width="small"),
     "size_bytes": st.column_config.NumberColumn("size", format="compact", width=60),
     "has_attachments": st.column_config.CheckboxColumn("attach", width=60),
 }
 
+# --- Review-page filter state -------------------------------------------------
 
-def message_table_with_actions(
-    conn: sqlite3.Connection, df: pd.DataFrame, key: str
-) -> None:
-    """Render messages with select checkboxes + approve/reject controls."""
-    st.metric(label="Total Rows", value=len(df))
-    if df.empty:
-        st.info("No messages match this view.")
-        return
+#: session_state keys for each filter widget, so presets can pre-fill them.
+_FILTER_KEYS = {
+    "fts": "flt_fts",
+    "review_status": "flt_status",
+    "proposed_action": "flt_action",
+    "staged_label": "flt_label",
+    "ai_category": "flt_category",
+    "conf": "flt_conf",
+    "from_addr": "flt_from",
+    "from_domain": "flt_domain",
+    "has_attachments": "flt_attach",
+}
 
+#: empty value each filter widget resets to (and the value a preset omits).
+_FILTER_DEFAULTS: dict = {
+    "fts": "",
+    "review_status": [],
+    "proposed_action": [],
+    "staged_label": [],
+    "ai_category": [],
+    "conf": (0.0, 1.0),
+    "from_addr": "",
+    "from_domain": "",
+    "has_attachments": False,
+}
+
+#: order override is not a widget; presets set it and a normal browse clears it.
+_ORDER_KEY = "flt_order"
+
+#: Named presets → the widget values they apply. Each maps a subset of
+#: _FILTER_KEYS; unlisted widgets are reset to their empty default.
+_PRESETS: dict[str, dict] = {
+    "Pending trash": {
+        "proposed_action": [ProposedAction.TRASH.value],
+        "review_status": [ReviewStatus.PENDING.value],
+    },
+    "Auto-approved": {"review_status": [ReviewStatus.AUTO_APPROVED.value]},
+    "Uncertain": {"conf": (0.0, cfg.uncertain_confidence_threshold)},
+    "Oldest promotions": {
+        "staged_label": [
+            StagedLabel.DELETE_CANDIDATE.value,
+            StagedLabel.UNSUBSCRIBE_CANDIDATE.value,
+        ],
+        "_order": "oldest",
+    },
+}
+
+
+def _set_filters(spec: dict) -> None:
+    """Write `spec`'s values into the filter widgets' session_state, resetting
+    every unlisted filter to its empty default."""
+    for key, state_key in _FILTER_KEYS.items():
+        st.session_state[state_key] = spec.get(key, _FILTER_DEFAULTS[key])
+    st.session_state[_ORDER_KEY] = spec.get("_order", "default")
+
+
+def _apply_preset(name: str) -> None:
+    """Apply a named preset's values to the filter widgets (others cleared)."""
+    _set_filters(_PRESETS[name])
+
+
+def _clear_filters() -> None:
+    _set_filters({})
+
+
+def collect_filters() -> tuple[dict, str]:
+    """Render the Review sidebar (presets + combinable filters); return
+    (filters dict for the query builder, order key)."""
+    st.sidebar.subheader("Presets")
+    cols = st.sidebar.columns(2)
+    for i, name in enumerate(_PRESETS):
+        if cols[i % 2].button(name, key=f"preset_{name}", use_container_width=True):
+            _apply_preset(name)
+            st.rerun()
+    if st.sidebar.button("Clear filters", use_container_width=True):
+        _clear_filters()
+        st.rerun()
+
+    st.sidebar.subheader("Filters")
+    fts = st.sidebar.text_input("Full-text search (FTS5)", key=_FILTER_KEYS["fts"])
+    review_status = st.sidebar.multiselect(
+        "Review status",
+        [s.value for s in ReviewStatus],
+        key=_FILTER_KEYS["review_status"],
+    )
+    proposed_action = st.sidebar.multiselect(
+        "Proposed action",
+        [a.value for a in ProposedAction],
+        key=_FILTER_KEYS["proposed_action"],
+    )
+    staged_label = st.sidebar.multiselect(
+        "Staged label", [s.value for s in StagedLabel], key=_FILTER_KEYS["staged_label"]
+    )
+    ai_category = st.sidebar.multiselect(
+        "Category", list(CATEGORIES), key=_FILTER_KEYS["ai_category"]
+    )
+    conf_lo, conf_hi = st.sidebar.slider(
+        "Confidence range", 0.0, 1.0, (0.0, 1.0), 0.05, key=_FILTER_KEYS["conf"]
+    )
+    from_addr = st.sidebar.text_input("Sender contains", key=_FILTER_KEYS["from_addr"])
+    from_domain = st.sidebar.text_input(
+        "Domain contains", key=_FILTER_KEYS["from_domain"]
+    )
+    has_attachments = st.sidebar.checkbox(
+        "Has attachments", key=_FILTER_KEYS["has_attachments"]
+    )
+
+    filters: dict = {
+        "fts": fts,
+        "review_status": review_status,
+        "proposed_action": proposed_action,
+        "staged_label": staged_label,
+        "ai_category": ai_category,
+        "from_addr": from_addr,
+        "from_domain": from_domain,
+        "has_attachments": has_attachments,
+    }
+    # Only apply confidence bounds when the user narrowed the full 0–1 range.
+    if conf_lo > 0.0:
+        filters["conf_lo"] = conf_lo
+    if conf_hi < 1.0:
+        filters["conf_hi"] = conf_hi
+
+    order = st.session_state.get(_ORDER_KEY, "default")
+    return filters, order
+
+
+def _filter_hash(filters: dict, order: str) -> str:
+    """Stable short hash of the active filters, so the grid's selection state
+    resets when the row set changes."""
+    payload = repr(sorted(filters.items())) + order
+    return hashlib.md5(payload.encode()).hexdigest()[:8]
+
+
+def _prep_display(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.insert(0, "select", False)
     if "date_utc" in df:
         df["date_utc"] = pd.to_datetime(df["date_utc"], errors="coerce", utc=True)
     if "has_attachments" in df:
         df["has_attachments"] = df["has_attachments"].fillna(0).astype(bool)
+    return df
 
+
+def review_browser(conn: sqlite3.Connection, df: pd.DataFrame, key: str) -> None:
+    """Render the message grid with row-selection → bulk actions + detail panel.
+
+    Selecting rows drives BOTH the bulk approve/reject controls (all selected
+    rows) and the detail panel (the last-selected row's full email).
+    """
+    if df.empty:
+        st.info("No messages match these filters.")
+        return
+
+    view_df = _prep_display(df)
     multiline = st.toggle("Multiline rows", value=True, key=f"ml_{key}")
-    edited = st.data_editor(
-        df,
+    event = st.dataframe(
+        view_df,
         hide_index=True,
-        disabled=[c for c in df.columns if c != "select"],
         column_config=MESSAGE_COLUMN_CONFIG,
-        column_order=[c for c in MESSAGE_COLUMN_ORDER if c in df.columns]
-        + [c for c in df.columns if c not in MESSAGE_COLUMN_ORDER],
-        # Taller rows make text columns (subject, reason) wrap across lines.
+        column_order=[c for c in MESSAGE_COLUMN_ORDER if c in view_df.columns]
+        + [c for c in view_df.columns if c not in MESSAGE_COLUMN_ORDER],
+        on_select="rerun",
+        selection_mode="multi-row",
+        # Taller rows let the subject column wrap across lines.
         row_height=76 if multiline else None,
-        key=f"editor_{key}",
-        height=800,
+        height=560,
+        key=f"grid_{key}",
     )
-    selected_ids = edited.loc[edited["select"], "id"].astype(int).tolist()
-    all_ids = df["id"].astype(int).tolist()
+    # Positional indices into view_df (same object/order we passed in).
+    sel = event.selection["rows"]
+    selected_ids = view_df.iloc[sel]["id"].astype(int).tolist()
+    all_ids = view_df["id"].astype(int).tolist()
 
     c1, c2, c3, c4 = st.columns(4)
     if c1.button(f"Approve selected ({len(selected_ids)})", key=f"as_{key}"):
@@ -160,13 +306,87 @@ def message_table_with_actions(
 
     st.download_button(
         "Download CSV (sanitized)",
-        data=sanitized_csv(df),
+        data=sanitized_csv(view_df),
         file_name=f"{key}_export.csv",
         mime="text/csv",
         key=f"dl_{key}",
         help="Formula-injection-safe export. Prefer this over the table "
         "toolbar's built-in download.",
     )
+
+    st.divider()
+    active_id = selected_ids[-1] if selected_ids else None
+    render_message_detail(conn, active_id, key)
+
+
+def _fmt_attachments(row) -> str:
+    if not row["has_attachments"]:
+        return "none"
+    raw = row["attachment_names"]
+    if not raw:
+        return "(yes, names unknown)"
+    try:
+        names = json.loads(raw)
+        if isinstance(names, list):
+            return ", ".join(str(n) for n in names) or "(yes)"
+    except (ValueError, TypeError):
+        pass
+    return str(raw)
+
+
+def render_message_detail(
+    conn: sqlite3.Connection, msg_id: int | None, key: str
+) -> None:
+    """Full email detail for the selected row: headers, reason, body, audit."""
+    if msg_id is None:
+        st.caption("Select a row above to read the full email.")
+        return
+    row = conn.execute(queries.MESSAGE_DETAIL, (msg_id,)).fetchone()
+    if row is None:
+        st.warning(f"Message {msg_id} not found.")
+        return
+
+    st.subheader(row["subject"] or "(no subject)")
+
+    a, r = st.columns(2)
+    if a.button("Approve this", key=f"da_{key}_{msg_id}"):
+        set_status(conn, [msg_id], ReviewStatus.APPROVED.value)
+        st.rerun()
+    if r.button("Reject this", key=f"dr_{key}_{msg_id}"):
+        set_status(conn, [msg_id], ReviewStatus.REJECTED.value)
+        st.rerun()
+
+    st.markdown(
+        f"**From:** {row['from_addr'] or ''}  \n"
+        f"**To:** {row['to_addr'] or ''}  \n"
+        f"**Date:** {row['date_utc'] or ''}  \n"
+        f"**Gmail labels:** {row['labels'] or ''}  \n"
+        f"**Attachments:** {_fmt_attachments(row)}  \n"
+        f"**Status:** {row['review_status']} · **Action:** {row['proposed_action']} "
+        f"· **Staged:** {row['staged_label']}  \n"
+        f"**Category:** {row['ai_category']} · **Confidence:** {row['ai_confidence']} "
+        f"· **By:** {row['classified_by']}"
+    )
+    with st.expander("AI reason", expanded=True):
+        st.write(row["ai_reason"] or "—")
+
+    # body_text is plain text (no HTML stored); read-only scrollable box.
+    st.text_area(
+        "Body",
+        row["body_text"] or "",
+        height=400,
+        disabled=True,
+        key=f"body_{key}_{msg_id}",
+    )
+
+    hits = df_query(conn, queries.RULE_HITS_FOR_MESSAGE, (msg_id,))
+    if not hits.empty:
+        st.caption("Rule hits")
+        st.dataframe(hits, hide_index=True)
+    history = df_query(conn, queries.ACTIONS_FOR_MESSAGE, (msg_id,))
+    if not history.empty:
+        st.caption("Action history")
+        st.dataframe(history, hide_index=True)
 
 
 def group_table_with_actions(
@@ -238,134 +458,66 @@ def group_table_with_actions(
         st.session_state[snap_key] = fresh_ids
 
 
-def render_detail(conn: sqlite3.Connection) -> None:
-    with st.expander("Inspect a message by id"):
-        msg_id = st.number_input("Message id", min_value=1, step=1, value=1)
-        if st.button("Load message"):
-            row = conn.execute(queries.MESSAGE_DETAIL, (msg_id,)).fetchone()
-            if row is None:
-                st.warning(f"No message with id {msg_id}")
-                return
-            st.write({k: row[k] for k in row.keys() if k != "body_text"})
-            st.text_area("Body", row["body_text"] or "", height=240)
-            hits = df_query(conn, queries.RULE_HITS_FOR_MESSAGE, (msg_id,))
-            if not hits.empty:
-                st.write("Rule hits:", hits)
-            history = df_query(conn, queries.ACTIONS_FOR_MESSAGE, (msg_id,))
-            if not history.empty:
-                st.write("Action history:", history)
+# --- Pages -------------------------------------------------------------------
+
+
+def page_review(conn: sqlite3.Connection) -> None:
+    filters, order = collect_filters()
+    sql, params = queries.build_message_query(filters, order=order)
+    count_sql, count_params = queries.build_message_count(filters)
+    total = conn.execute(count_sql, count_params).fetchone()[0]
+    df = df_query(conn, sql, params)
+    if total > len(df):
+        st.caption(
+            f"Showing newest {len(df)} of {total} matching messages "
+            f"({queries.BROWSER_LIMIT}-row cap)."
+        )
+    else:
+        st.caption(f"{total} matching messages.")
+
+    key = f"review_{_filter_hash(filters, order)}"
+    try:
+        review_browser(conn, df, key=key)
+    except (sqlite3.OperationalError, pd.errors.DatabaseError) as exc:
+        st.error(f"Bad query (check FTS syntax): {exc}")
+
+
+def page_senders(conn: sqlite3.Connection) -> None:
+    sub = st.sidebar.radio("Group", ("By sender", "By domain", "Largest senders"))
+    if sub == "By sender":
+        group_table_with_actions(
+            conn, df_query(conn, queries.BY_SENDER), "from_addr", "sender"
+        )
+    elif sub == "By domain":
+        group_table_with_actions(
+            conn, df_query(conn, queries.BY_DOMAIN), "from_domain", "domain"
+        )
+    else:
+        st.dataframe(df_query(conn, queries.LARGEST_SENDERS), hide_index=True)
+
+
+def page_overview(conn: sqlite3.Connection) -> None:
+    st.subheader("Pipeline state")
+    st.write("By review status / proposed action:")
+    st.dataframe(df_query(conn, queries.STATUS_COUNTS), hide_index=True)
+    st.write("By staged label:")
+    st.dataframe(df_query(conn, queries.STAGED_COUNTS), hide_index=True)
 
 
 def main() -> None:
     st.title("email-cleaner — review proposals")
     conn = get_conn()
 
-    view = st.sidebar.radio(
-        "View",
-        (
-            "Overview",
-            "Proposed trash",
-            "Auto-approved",
-            "By sender",
-            "By domain",
-            "Largest senders",
-            "Oldest promotions",
-            "Uncertain classifications",
-            "Search",
-            "By status",
-        ),
-    )
+    page = st.sidebar.radio("Page", ("Review", "Senders", "Overview"))
+    st.sidebar.divider()
 
-    if view == "Overview":
-        st.subheader("Pipeline state")
-        st.write("By review status / proposed action:")
-        st.dataframe(df_query(conn, queries.STATUS_COUNTS), hide_index=True)
-        st.write("By staged label:")
-        st.dataframe(df_query(conn, queries.STAGED_COUNTS), hide_index=True)
+    if page == "Review":
+        page_review(conn)
+    elif page == "Senders":
+        page_senders(conn)
+    else:
+        page_overview(conn)
 
-    elif view == "Proposed trash":
-        statuses = st.sidebar.multiselect(
-            "Review status",
-            [s.value for s in ReviewStatus],
-            default=[ReviewStatus.PENDING.value],
-        )
-        if statuses:
-            sql = queries.PROPOSED_TRASH.format(statuses=queries.in_clause(statuses))
-            message_table_with_actions(conn, df_query(conn, sql), key="trash")
-
-    elif view == "Auto-approved":
-        st.caption(
-            "Messages the policy gates auto-approved for trash or archive. Reject "
-            "anything you want to keep — `apply` will act on the rest."
-        )
-        message_table_with_actions(
-            conn, df_query(conn, queries.AUTO_APPROVED), key="auto"
-        )
-
-    elif view == "By sender":
-        group_table_with_actions(
-            conn, df_query(conn, queries.BY_SENDER), "from_addr", "sender"
-        )
-
-    elif view == "By domain":
-        group_table_with_actions(
-            conn, df_query(conn, queries.BY_DOMAIN), "from_domain", "domain"
-        )
-
-    elif view == "Largest senders":
-        st.dataframe(df_query(conn, queries.LARGEST_SENDERS), hide_index=True)
-
-    elif view == "Oldest promotions":
-        message_table_with_actions(
-            conn, df_query(conn, queries.OLDEST_PROMOS), key="promos"
-        )
-
-    elif view == "Uncertain classifications":
-        threshold = st.sidebar.slider(
-            "Confidence below", 0.0, 1.0, cfg.uncertain_confidence_threshold, 0.05
-        )
-        message_table_with_actions(
-            conn, df_query(conn, queries.UNCERTAIN, (threshold,)), key="uncertain"
-        )
-
-    elif view == "Search":
-        term = st.text_input("Full-text search (FTS5 syntax)")
-        if term:
-            try:
-                message_table_with_actions(
-                    conn, df_query(conn, queries.FTS_SEARCH, (term,)), key="search"
-                )
-            except (sqlite3.OperationalError, pd.errors.DatabaseError) as exc:
-                st.error(f"Bad FTS query: {exc}")
-
-    elif view == "By status":
-        group_by = st.sidebar.radio(
-            "Group by", ("Review status / proposed action", "Staged label")
-        )
-        ALL = "(all)"
-        params: dict[str, str | None] = {"status": None, "action": None, "label": None}
-        if group_by == "Staged label":
-            label = st.sidebar.selectbox("Staged label", [ALL, *StagedLabel])
-            if label != ALL:
-                params["label"] = label
-        else:
-            status = st.sidebar.selectbox("Review status", [ALL, *ReviewStatus])
-            action = st.sidebar.selectbox("Proposed action", [ALL, *ProposedAction])
-            if status != ALL:
-                params["status"] = status
-            if action != ALL:
-                params["action"] = action
-
-        total = conn.execute(queries.BY_STATUS_COUNT, params).fetchone()[0]
-        df = df_query(conn, queries.BY_STATUS, params)
-        if total > len(df):
-            st.caption(f"Showing newest {len(df)} of {total} matching messages.")
-        # Key the editor by the active filters so checkbox state resets when
-        # the filter (and therefore the row set) changes.
-        filter_key = "_".join(str(v) for v in params.values())
-        message_table_with_actions(conn, df, key=f"bystatus_{filter_key}")
-
-    render_detail(conn)
     conn.close()
 
 
