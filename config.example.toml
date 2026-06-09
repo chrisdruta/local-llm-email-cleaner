@@ -1,0 +1,52 @@
+# local-llm-email-cleaner configuration.
+# Env vars override file values: EMAIL_CLEANER_DB, EMAIL_CLEANER_OLLAMA_URL,
+# EMAIL_CLEANER_OLLAMA_MODEL, EMAIL_CLEANER_OLLAMA_CONCURRENCY,
+# EMAIL_CLEANER_CONFIG (alternate path to this file).
+
+[paths]
+db = "data/email.db"
+mbox = "data/takeout.mbox"
+credentials = "secrets/credentials.json"
+token = "secrets/token.json"
+
+[ollama]
+# From inside the devcontainer, the Windows-host Ollama server is reachable via
+# host.docker.internal. Run `ollama list` on the host for the exact model tag.
+url = "http://host.docker.internal:11434"
+model = "gemma4:e4b-it-q8_0"
+max_body_chars = 3000
+batch_size = 100
+request_timeout_s = 180
+# Classification requests in flight at once. Only helps beyond the server's
+# slot count if Ollama is started with OLLAMA_NUM_PARALLEL >= this value
+# (extra requests just queue server-side, which is harmless).
+concurrency = 4
+
+[rules]
+# Your own address(es) — used to find Sent mail and derive known contacts.
+user_addresses = []
+
+[policy]
+auto_trash_min_confidence = 0.90
+auto_trash_min_age_months = 12
+# Timely/recurring digests (daily Reddit, news/social roundups) are flagged
+# ephemeral and may auto-trash without the year-old floor above — they only
+# need this many days of grace (so you can still catch them in review first).
+auto_trash_ephemeral_min_age_days = 7
+# Archive auto-approval (reversible; archived mail gets [gmail].archive_label).
+# Applies to rule-staged archive candidates and, when the LLM weighed in, only
+# above this confidence. Set to a value > 1 to disable auto-archive entirely.
+auto_archive_min_confidence = 0.80
+
+[gmail]
+oauth_port = 8765
+requests_per_second = 5
+uncertain_confidence_threshold = 0.75
+# Gmail label added to messages the runner archives (created on first use),
+# so they stay easy to find — and bulk-undo — in Gmail. "" disables labeling.
+archive_label = "EmailCleaner/Archived"
+
+[voice]
+# `email-cleaner voice-export` writes Google Voice SMS / call-log backups here.
+# Staging those messages for trash is the `rules` stage's job (the `voice` rule).
+out_dir = "data/voice-export"

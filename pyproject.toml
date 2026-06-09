@@ -4,7 +4,17 @@ version = "0.1.0"
 description = "Local-LLM-powered Gmail cleanup tool"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "click>=8.4.1",
+    "google-api-python-client>=2.197.0",
+    "google-auth-httplib2>=0.4.0",
+    "google-auth-oauthlib>=1.4.0",
+    "langchain-core>=1.4.0",
+    "langchain-ollama>=1.1.0",
+    "pandas>=3.0.3",
+    "streamlit>=1.58.0",
+    "tqdm>=4.68.1",
+]
 
 [project.scripts]
 email-cleaner = "local_llm_email_cleaner:main"
@@ -12,3 +22,9 @@ email-cleaner = "local_llm_email_cleaner:main"
 [build-system]
 requires = ["uv_build>=0.11.19,<0.12.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "sqv>=0.5.0",
+]
