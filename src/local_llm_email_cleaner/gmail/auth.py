@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -32,8 +33,21 @@ def get_credentials(cfg: Config) -> Credentials:
 
     if creds and creds.expired and creds.refresh_token:
         logger.info("Refreshing expired Gmail token")
-        creds.refresh(Request())
-    else:
+        try:
+            creds.refresh(Request())
+        except RefreshError as exc:
+            # Refresh tokens expire/revoke (Google drops them after 7 days for
+            # apps in OAuth "testing" mode). Don't wedge every command on a
+            # stale token — discard it and fall through to a fresh login.
+            logger.warning(
+                "Gmail token refresh failed (%s); discarding %s and re-authorizing",
+                exc,
+                cfg.token_path,
+            )
+            cfg.token_path.unlink(missing_ok=True)
+            creds = None
+
+    if not (creds and creds.valid):
         if not cfg.credentials_path.is_file():
             raise MissingCredentialsError(
                 f"No OAuth client file at {cfg.credentials_path}. Create a Google Cloud "

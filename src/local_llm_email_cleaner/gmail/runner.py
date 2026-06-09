@@ -20,6 +20,7 @@ leaves review_status untouched, so the run is safely re-runnable.
 
 from __future__ import annotations
 
+import http.client
 import logging
 import sqlite3
 import time
@@ -45,10 +46,15 @@ MAX_ATTEMPTS = 5
 RETRYABLE_HTTP = {429, 500, 502, 503}
 ARCHIVE_BATCH_SIZE = 1000  # batchModify's documented per-call id limit
 
+# Transient network failures from request.execute() that are NOT HttpError
+# (httplib2 raises raw socket/SSL errors on connection drops, timeouts, resets).
+# socket.timeout, ConnectionError, ssl.SSLError all subclass OSError.
+RETRYABLE_NETWORK_ERRORS = (OSError, http.client.HTTPException)
+
 # Must stay in lockstep with review.queries.EXPORT_ACTIONS — both build the
 # approved-actionable predicate from the same models constants.
 _SELECT_APPROVED = f"""
-SELECT id, gmail_msgid, rfc_message_id, from_addr, subject, proposed_action
+SELECT id, gmail_msgid, rfc_message_id, from_addr, subject, date_epoch, proposed_action
 FROM messages
 WHERE review_status IN ({sql_in_list(APPROVABLE_STATUSES)})
   AND proposed_action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
@@ -105,6 +111,20 @@ def make_executor(throttle: Throttle) -> Callable:
                 if attempt < MAX_ATTEMPTS and _is_rate_limit(err):
                     logger.warning(
                         "Rate limited (attempt %d); backing off %.0fs", attempt, delay
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise
+            except RETRYABLE_NETWORK_ERRORS as err:
+                # A transient connection drop/timeout/reset — back off and retry
+                # the same as a rate limit, instead of aborting the whole run.
+                if attempt < MAX_ATTEMPTS:
+                    logger.warning(
+                        "Transient network error (attempt %d); backing off %.0fs: %s",
+                        attempt,
+                        delay,
+                        err,
                     )
                     time.sleep(delay)
                     delay *= 2
@@ -195,8 +215,11 @@ def _finalize_action(
     )
 
 
-def _http_status(err: HttpError) -> int | None:
-    return err.resp.status if err.resp else None
+def _http_status(err: Exception) -> int | None:
+    # HttpError carries a response with a status; transient network errors
+    # don't, so report None for them.
+    resp = getattr(err, "resp", None)
+    return resp.status if resp else None
 
 
 def apply_actions(
@@ -230,7 +253,7 @@ def apply_actions(
             body["addLabelIds"] = [archive_label_id]
         try:
             executor(service.users().messages().batchModify(userId="me", body=body))
-        except HttpError as err:
+        except (HttpError, *RETRYABLE_NETWORK_ERRORS) as err:
             # Whole chunk fails together; review_status stays approved, so a
             # re-run re-reconciles and retries these messages.
             for _, _, action_id in pending_archive:
@@ -264,7 +287,7 @@ def apply_actions(
         action = row["proposed_action"]
         try:
             rec = reconcile_message(service, row, executor)
-        except HttpError as err:
+        except (HttpError, *RETRYABLE_NETWORK_ERRORS) as err:
             _insert_action(
                 conn,
                 row["id"],
@@ -315,7 +338,7 @@ def apply_actions(
                 executor(
                     service.users().messages().trash(userId="me", id=rec.gmail_api_id)
                 )
-            except HttpError as err:
+            except (HttpError, *RETRYABLE_NETWORK_ERRORS) as err:
                 _finalize_action(
                     conn,
                     action_id,
@@ -343,7 +366,7 @@ def apply_actions(
                     archive_label_id = _ensure_label(
                         service, executor, cfg.archive_label
                     )
-                except HttpError as err:
+                except (HttpError, *RETRYABLE_NETWORK_ERRORS) as err:
                     _insert_action(
                         conn,
                         row["id"],

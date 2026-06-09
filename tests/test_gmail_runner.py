@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import re
+import socket
+from email.utils import parseaddr
 
 from conftest import insert_message
 
@@ -29,9 +32,28 @@ class FakeMessagesApi:
         self.batch_modified: list[dict] = []
 
     def list(self, userId, q, maxResults):
-        rfc_id = q.removeprefix("rfc822msgid:")
-        hit = self.live.get(rfc_id)
-        return FakeRequest(lambda: {"messages": [{"id": hit["id"]}]} if hit else {})
+        if q.startswith("rfc822msgid:"):
+            # The value is quoted to keep whitespace/operators literal.
+            rfc_id = q.removeprefix("rfc822msgid:").strip('"')
+            hit = self.live.get(rfc_id)
+            return FakeRequest(lambda: {"messages": [{"id": hit["id"]}]} if hit else {})
+        # Metadata fallback: from:"addr" subject:"subj" after:.. before:..
+        want_from = (re.search(r'from:"([^"]*)"', q) or [None, None])[1]
+        want_subj = (re.search(r'subject:"([^"]*)"', q) or [None, None])[1]
+        matches = []
+        for entry in self.live.values():
+            _, addr = parseaddr(entry["headers"].get("From", ""))
+            if want_from and addr.lower() != want_from.lower():
+                continue
+            if (
+                want_subj is not None
+                and entry["headers"].get("Subject", "") != want_subj
+            ):
+                continue
+            matches.append({"id": entry["id"]})
+        return FakeRequest(
+            lambda: {"messages": matches[:maxResults]} if matches else {}
+        )
 
     def get(self, userId, id, format, metadataHeaders):
         for entry in self.live.values():
@@ -408,6 +430,127 @@ def test_archive_chunking_respects_batch_size(conn, cfg, monkeypatch):
     stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
     assert stats.succeeded == 3
     assert [b["ids"] for b in api.batch_modified] == [["G1", "G2"], ["G3"]]
+
+
+def test_message_id_with_space_is_quoted_not_split(conn, cfg):
+    """A malformed Message-ID containing a space must be searched as one literal
+    value (quoted), not split into two ANDed terms."""
+    weird = "foo bar@mail.example"
+    msg_id = approved_message(conn, rfc_id=weird)
+    api = FakeMessagesApi(live_entry(weird, "G1"))
+
+    captured = {}
+    original_list = api.list
+
+    def spy_list(userId, q, maxResults):
+        captured["q"] = q
+        return original_list(userId=userId, q=q, maxResults=maxResults)
+
+    api.list = spy_list
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert captured["q"] == 'rfc822msgid:"foo bar@mail.example"'
+    assert stats.succeeded == 1
+    assert get_status(conn, msg_id) == "applied"
+
+
+def test_metadata_fallback_reconciles_without_message_id(conn, cfg):
+    """No RFC Message-ID -> reconcile by sender+subject+date and still act."""
+    msg_id = approved_message(conn, rfc_id=None)  # default from/subject/date
+    api = FakeMessagesApi(live_entry("any-key", "G5"))  # matches default From+Subject
+
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert stats.succeeded == 1
+    assert api.trashed == ["G5"]
+    assert get_status(conn, msg_id) == "applied"
+
+    audit = conn.execute(
+        "SELECT * FROM actions WHERE message_id=?", (msg_id,)
+    ).fetchone()
+    assert audit["match_method"] == "metadata"
+    assert audit["match_confirmed"] == 1
+
+
+def test_metadata_fallback_ambiguous_skips(conn, cfg):
+    """Two live messages match the metadata -> skip, never guess."""
+    msg_id = approved_message(conn, rfc_id=None)
+    live = live_entry("k1", "G1") | live_entry("k2", "G2")  # both match default
+    api = FakeMessagesApi(live)
+
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert stats.skipped == 1 and api.trashed == []
+    assert get_status(conn, msg_id) == "skipped"
+
+
+def test_metadata_fallback_subject_mismatch_skips(conn, cfg):
+    """Single live hit whose subject differs is not confirmed (strict match)."""
+    msg_id = approved_message(conn, rfc_id=None)
+    entry = live_entry("k1", "G1")
+    entry["k1"]["headers"]["Subject"] = "a totally different subject"
+    api = FakeMessagesApi(entry)
+
+    # The narrowed search wouldn't return it, but force the candidate through to
+    # prove the post-fetch subject check is what rejects it.
+    api.list = lambda userId, q, maxResults: FakeRequest(
+        lambda: {"messages": [{"id": "G1"}]}
+    )
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert stats.skipped == 1 and api.trashed == []
+    assert get_status(conn, msg_id) == "skipped"
+
+
+def test_transient_network_error_is_retried_then_succeeds(conn, cfg, monkeypatch):
+    """A transient (non-HttpError) failure backs off and retries, not aborts."""
+    monkeypatch.setattr(runner.time, "sleep", lambda _s: None)
+    msg_id = approved_message(conn)
+    api = FakeMessagesApi(live_entry("m1@example.com", "G1"))
+
+    calls = {"n": 0}
+    original_trash = api.trash
+
+    def flaky_trash(userId, id):
+        def _run():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise socket.timeout("connection timed out")
+            return original_trash(userId=userId, id=id).execute()
+
+        return FakeRequest(_run)
+
+    api.trash = flaky_trash
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert stats.succeeded == 1
+    assert api.trashed == ["G1"]
+    assert get_status(conn, msg_id) == "applied"
+
+
+def test_persistent_transient_error_isolated_run_continues(conn, cfg, monkeypatch):
+    """One message failing with a transient error after all retries records an
+    error and does NOT abort the run; later messages still process."""
+    monkeypatch.setattr(runner.time, "sleep", lambda _s: None)
+    bad = approved_message(conn, rfc_id="bad@example.com")
+    good = approved_message(conn, rfc_id="good@example.com")
+    live = live_entry("bad@example.com", "GBAD") | live_entry(
+        "good@example.com", "GOOD"
+    )
+    api = FakeMessagesApi(live)
+
+    def trash(userId, id):
+        if id == "GBAD":
+            return FakeRequest(lambda: (_ for _ in ()).throw(ConnectionResetError()))
+        return FakeRequest(lambda: api.trashed.append(id) or {"id": id})
+
+    api.trash = trash
+    stats = runner.apply_actions(conn, cfg, FakeService(api), execute=True)
+    assert stats.errors == 1 and stats.succeeded == 1
+    assert api.trashed == ["GOOD"]
+    assert get_status(conn, bad) == "approved"  # untouched -> re-runnable
+    assert get_status(conn, good) == "applied"
+
+    audit = conn.execute(
+        "SELECT status, http_status FROM actions WHERE message_id=?", (bad,)
+    ).fetchone()
+    assert audit["status"] == "error"
+    assert audit["http_status"] is None  # transient errors carry no HTTP status
 
 
 def test_permanent_delete_never_used():
