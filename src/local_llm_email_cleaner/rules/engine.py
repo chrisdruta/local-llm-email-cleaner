@@ -6,8 +6,11 @@ Semantics:
    label overrides the keyword protections (scam bait imitates exactly those
    subjects) but never known_contact; overridden hits are still recorded, so
    the gates refuse to auto-approve such messages — human review only.
-2. Candidate rules vote cleanup classes; the most conservative wins
-   (ARCHIVE > DELETE > UNSUBSCRIBE), but every hit is recorded in rule_hits.
+2. Candidate rules vote cleanup classes; the winning vote is the one with the
+   highest RuleVote.priority, ties broken by the most conservative staged_label
+   (ARCHIVE > DELETE > UNSUBSCRIBE). Every hit is recorded in rule_hits. The
+   winner's own fields (ephemeral, skip_llm) drive the disposition — the engine
+   does not special-case any rule by name.
 3. No hits at all -> NEEDS_REVIEW, left for the LLM classifier.
 """
 
@@ -32,12 +35,26 @@ from .views import MessageView, RuleContext
 
 logger = logging.getLogger(__name__)
 
-# Most conservative outcome first; trumps later entries when several rules fire.
+# Most conservative outcome first; breaks ties among equal-priority votes.
 _CANDIDATE_PRECEDENCE = (
     StagedLabel.ARCHIVE_CANDIDATE,
     StagedLabel.DELETE_CANDIDATE,
     StagedLabel.UNSUBSCRIBE_CANDIDATE,
 )
+
+
+def _select_candidate(votes: tuple[RuleVote, ...]) -> RuleVote:
+    """Pick the winning candidate vote: highest priority, then most conservative
+    staged_label. The choice is data-driven — no rule is matched by name."""
+    top = max(v.priority for v in votes)
+    contenders = [v for v in votes if v.priority == top]
+    if len(contenders) == 1:
+        return contenders[0]
+    by_label = {v.staged_label: v for v in reversed(contenders)}  # keep first seen
+    for label in _CANDIDATE_PRECEDENCE:
+        if label in by_label:
+            return by_label[label]
+    return contenders[0]
 
 
 @dataclass(frozen=True)
@@ -67,41 +84,20 @@ def evaluate_message(msg: MessageView, ctx: RuleContext) -> RuleResult:
     # policy gates can never auto-approve these — they always reach a human.
     candidate_hits = tuple(v for rule in CANDIDATE_RULES if (v := rule(msg, ctx)))
 
-    # Voice override: Google Voice SMS / call-log / voicemail records are
-    # synthetic emails, not real mail — they're backed up to disk by
-    # `voice-export` and always staged for trash. Tagged 'voice' so the LLM
-    # classifier skips them (it can't meaningfully judge a text message), which
-    # also keeps them out of the auto-trash gate (human review only).
-    voice_hit = next((v for v in candidate_hits if v.rule_name == "voice"), None)
-    if voice_hit is not None:
-        return RuleResult(
-            StagedLabel.DELETE_CANDIDATE,
-            voice_hit.category,
-            keyword_hits + candidate_hits,
-            classified_by=CLASSIFIED_BY_VOICE,
-        )
-
-    # Digest override: a timely/recurring digest is known-disposable, so it
-    # beats the normal "most conservative wins" precedence (a Reddit digest
-    # also hits updates_label -> ARCHIVE) and is marked ephemeral, letting the
-    # policy gate auto-trash it without the usual age floor. The LLM still gets
-    # the final say in `classify` (DELETE_CANDIDATEs are second-opinioned).
-    digest_hit = next((v for v in candidate_hits if v.rule_name == "digest"), None)
-    if digest_hit is not None:
-        return RuleResult(
-            StagedLabel.DELETE_CANDIDATE,
-            digest_hit.category,
-            keyword_hits + candidate_hits,
-            ephemeral=True,
-        )
-
+    # The winning vote's own fields drive the disposition — no rule is matched
+    # by name. A skip_llm vote (voice) is tagged so the classifier skips it (and
+    # the auto-trash gate never fires on it); an ephemeral vote (digest) lets the
+    # gate waive the age floor once the LLM also confirms; priority lets either
+    # beat the ordinary ARCHIVE > DELETE > UNSUBSCRIBE precedence.
     if candidate_hits:
-        for label in _CANDIDATE_PRECEDENCE:
-            winners = [v for v in candidate_hits if v.staged_label == label]
-            if winners:
-                return RuleResult(
-                    label, winners[0].category, keyword_hits + candidate_hits
-                )
+        winner = _select_candidate(candidate_hits)
+        return RuleResult(
+            winner.staged_label,
+            winner.category,
+            keyword_hits + candidate_hits,
+            ephemeral=winner.ephemeral,
+            classified_by=CLASSIFIED_BY_VOICE if winner.skip_llm else None,
+        )
 
     return RuleResult(StagedLabel.NEEDS_REVIEW, None, keyword_hits + candidate_hits)
 

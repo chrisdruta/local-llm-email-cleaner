@@ -213,6 +213,48 @@ class TestEvaluateMessage:
         assert result.classified_by is None
 
 
+def test_select_candidate_is_priority_then_precedence():
+    """Candidate selection is data-driven: highest priority wins, ties broken by
+    the conservative precedence — no rule is matched by name."""
+    from local_llm_email_cleaner.models import RuleKind, RuleVote
+
+    def vote(name, label, priority=0):
+        return RuleVote(name, RuleKind.CANDIDATE, label, name, priority=priority)
+
+    # Higher priority wins outright, even over a more-conservative label.
+    winner = engine._select_candidate(
+        (
+            vote("arch", StagedLabel.ARCHIVE_CANDIDATE),
+            vote("hi", StagedLabel.DELETE_CANDIDATE, priority=5),
+        )
+    )
+    assert winner.rule_name == "hi"
+
+    # Equal priority -> most conservative staged_label (ARCHIVE > DELETE).
+    winner = engine._select_candidate(
+        (
+            vote("d", StagedLabel.DELETE_CANDIDATE),
+            vote("a", StagedLabel.ARCHIVE_CANDIDATE),
+        )
+    )
+    assert winner.staged_label == StagedLabel.ARCHIVE_CANDIDATE
+
+
+def test_disposition_comes_from_vote_fields_not_rule_name():
+    """ephemeral / skip_llm on the winning vote drive the result; the engine
+    never inspects rule_name."""
+    result = engine.evaluate_message(
+        make_view(from_addr="noreply@redditmail.com", subject="Top posts"), self_ctx()
+    )
+    assert result.ephemeral is True  # from the digest vote's field
+    voice = engine.evaluate_message(make_view(labels=frozenset({"sms"})), self_ctx())
+    assert voice.classified_by == CLASSIFIED_BY_VOICE  # from the voice vote's skip_llm
+
+
+def self_ctx() -> RuleContext:
+    return RuleContext(known_contacts=frozenset({FRIEND_ADDR}))
+
+
 def test_rule_categories_are_canonical():
     """Every category a rule can vote must be in models.CATEGORIES (lockstep
     with the LLM's constrained category enum)."""

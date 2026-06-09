@@ -58,6 +58,16 @@ def _row(conn, msg_id):
     return conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
 
 
+def test_export_prefilter_derived_from_single_source_of_truth():
+    """The export's SQL prefilter is built from voice.VOICE_LABELS, the same set
+    classify_kind uses, so the two can't drift on which labels count."""
+    from local_llm_email_cleaner import voice_export
+
+    sql = voice_export._SELECT_SQL.lower()
+    for label in voice.VOICE_LABELS:
+        assert f"like '%{label}%'" in sql
+
+
 def add_inbound_sms(
     conn, *, name="Michael Redacted", number="+12164969651", body="hey"
 ):

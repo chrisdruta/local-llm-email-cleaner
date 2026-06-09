@@ -191,9 +191,20 @@ class ParsedMessage:
 
 @dataclass(frozen=True)
 class RuleVote:
-    """The outcome a single rule votes for on a message."""
+    """The outcome a single rule votes for on a message.
+
+    The disposition is carried as data, not inferred from rule_name: a vote can
+    declare itself ephemeral (digest-style, disposable regardless of age),
+    skip_llm (decided deterministically, never sent to the classifier), and a
+    priority that overrides the staged_label precedence when it fires.
+    """
 
     rule_name: str
     rule_kind: RuleKind
     staged_label: StagedLabel
     category: str
+    ephemeral: bool = False
+    skip_llm: bool = False
+    #: higher wins outright over staged_label precedence (e.g. voice > digest >
+    #: the ordinary ARCHIVE > DELETE > UNSUBSCRIBE ordering at priority 0)
+    priority: int = 0

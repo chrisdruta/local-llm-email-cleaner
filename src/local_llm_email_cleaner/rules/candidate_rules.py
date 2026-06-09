@@ -12,12 +12,30 @@ from . import patterns
 from .views import MessageView, RuleContext
 
 
-def _vote(name: str, label: StagedLabel, category: str) -> RuleVote:
+# Priorities above the default 0 let a vote win outright over the normal
+# staged_label precedence: voice (synthetic records, never LLM-judged) beats
+# digest (timely/disposable), which beats everything ordinary.
+_PRIORITY_DIGEST = 10
+_PRIORITY_VOICE = 20
+
+
+def _vote(
+    name: str,
+    label: StagedLabel,
+    category: str,
+    *,
+    ephemeral: bool = False,
+    skip_llm: bool = False,
+    priority: int = 0,
+) -> RuleVote:
     return RuleVote(
         rule_name=name,
         rule_kind=RuleKind.CANDIDATE,
         staged_label=label,
         category=category,
+        ephemeral=ephemeral,
+        skip_llm=skip_llm,
+        priority=priority,
     )
 
 
@@ -40,7 +58,16 @@ def digest(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
     # floor (see rules/engine.py and policy.py).
     sender_hit = msg.from_addr and patterns.DIGEST_SENDER_RE.search(msg.from_addr)
     if sender_hit or patterns.DIGEST_SUBJECT_RE.search(msg.subject):
-        return _vote("digest", StagedLabel.DELETE_CANDIDATE, "digest")
+        # ephemeral: the policy gate may waive the age floor (when the LLM also
+        # confirms); priority: beats a co-firing ARCHIVE vote (e.g. Reddit
+        # digests also carry the Forums label).
+        return _vote(
+            "digest",
+            StagedLabel.DELETE_CANDIDATE,
+            "digest",
+            ephemeral=True,
+            priority=_PRIORITY_DIGEST,
+        )
     return None
 
 
@@ -89,7 +116,15 @@ def voice(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
     # this hit so it skips the LLM and never auto-approves — see rules/engine.py.
     kind = voice_ingest.classify_kind(msg.labels)
     if kind is not None:
-        return _vote("voice", StagedLabel.DELETE_CANDIDATE, f"voice_{kind}")
+        # skip_llm: synthetic records the LLM can't meaningfully judge (the
+        # export already backed them up); priority: wins over any other label.
+        return _vote(
+            "voice",
+            StagedLabel.DELETE_CANDIDATE,
+            f"voice_{kind}",
+            skip_llm=True,
+            priority=_PRIORITY_VOICE,
+        )
     return None
 
 

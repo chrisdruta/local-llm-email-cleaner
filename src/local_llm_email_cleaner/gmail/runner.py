@@ -223,6 +223,45 @@ def _http_status(err: Exception) -> int | None:
     return resp.status if resp else None
 
 
+def _finalize_succeeded(
+    conn: sqlite3.Connection,
+    items: list[tuple[int, int]],
+    stats: ApplyStats,
+    progress: Callable[[ApplyStats], None] | None,
+) -> None:
+    """Finalize committed-intent action rows to SUCCESS and flip their messages
+    to APPLIED. `items` is (message_id, action_id) pairs — one for trash, the
+    whole chunk for archive."""
+    for _, action_id in items:
+        _finalize_action(conn, action_id, ActionStatus.SUCCESS.value)
+    conn.executemany(
+        f"UPDATE messages SET review_status='{ReviewStatus.APPLIED.value}' WHERE id=?",
+        [(message_id,) for message_id, _ in items],
+    )
+    conn.commit()
+    stats.succeeded += len(items)
+    if progress:
+        progress(stats)
+
+
+def _finalize_errored(
+    conn: sqlite3.Connection,
+    items: list[tuple[int, int]],
+    stats: ApplyStats,
+    err: Exception,
+    progress: Callable[[ApplyStats], None] | None,
+) -> None:
+    """Finalize action rows to ERROR; review_status is left untouched so the
+    messages are safely re-runnable."""
+    http_status, detail = _http_status(err), str(err)
+    for _, action_id in items:
+        _finalize_action(conn, action_id, ActionStatus.ERROR.value, http_status, detail)
+    conn.commit()
+    stats.errors += len(items)
+    if progress:
+        progress(stats)
+
+
 def apply_actions(
     conn: sqlite3.Connection,
     cfg: Config,
@@ -252,36 +291,19 @@ def apply_actions(
         }
         if archive_label_id is not None:
             body["addLabelIds"] = [archive_label_id]
+        items = [
+            (message_id, action_id) for message_id, _, action_id in pending_archive
+        ]
         try:
             executor(service.users().messages().batchModify(userId="me", body=body))
         except (HttpError, *RETRYABLE_NETWORK_ERRORS) as err:
             # Whole chunk fails together; review_status stays approved, so a
             # re-run re-reconciles and retries these messages.
-            for _, _, action_id in pending_archive:
-                _finalize_action(
-                    conn,
-                    action_id,
-                    ActionStatus.ERROR.value,
-                    _http_status(err),
-                    str(err),
-                )
-            conn.commit()
-            stats.errors += len(pending_archive)
+            _finalize_errored(conn, items, stats, err, progress)
             pending_archive.clear()
-            if progress:
-                progress(stats)
             return
-        for _, _, action_id in pending_archive:
-            _finalize_action(conn, action_id, ActionStatus.SUCCESS.value)
-        conn.executemany(
-            f"UPDATE messages SET review_status='{ReviewStatus.APPLIED.value}' WHERE id=?",
-            [(message_id,) for message_id, _, _ in pending_archive],
-        )
-        conn.commit()
-        stats.succeeded += len(pending_archive)
+        _finalize_succeeded(conn, items, stats, progress)
         pending_archive.clear()
-        if progress:
-            progress(stats)
 
     def reconciled_rows():
         # Reconcile a chunk at a time so the metadata gets batch into one HTTP
@@ -345,25 +367,9 @@ def apply_actions(
                     service.users().messages().trash(userId="me", id=rec.gmail_api_id)
                 )
             except (HttpError, *RETRYABLE_NETWORK_ERRORS) as err:
-                _finalize_action(
-                    conn,
-                    action_id,
-                    ActionStatus.ERROR.value,
-                    _http_status(err),
-                    str(err),
-                )
-                conn.commit()
-                stats.errors += 1
+                _finalize_errored(conn, [(row["id"], action_id)], stats, err, progress)
                 continue
-            _finalize_action(conn, action_id, ActionStatus.SUCCESS.value)
-            conn.execute(
-                f"UPDATE messages SET review_status='{ReviewStatus.APPLIED.value}' WHERE id=?",
-                (row["id"],),
-            )
-            conn.commit()
-            stats.succeeded += 1
-            if progress:
-                progress(stats)
+            _finalize_succeeded(conn, [(row["id"], action_id)], stats, progress)
         elif action == ProposedAction.ARCHIVE.value:
             # Resolve the label before writing the intent row so a label
             # failure doesn't leave a dangling attempt.

@@ -41,6 +41,11 @@ SMS_LABELS = frozenset({"sms"})
 CALL_LABELS = frozenset({"call log"})
 VOICEMAIL_LABELS = frozenset({"voicemail"})
 
+#: Every label that denotes a Google Voice message — the single source of truth
+#: for "is this a Voice record", shared by classify_kind() and the voice-export
+#: prefilter so they can never drift on which labels count.
+VOICE_LABELS = SMS_LABELS | CALL_LABELS | VOICEMAIL_LABELS
+
 KIND_SMS = "sms"
 KIND_CALL = "call"
 KIND_VOICEMAIL = "voicemail"

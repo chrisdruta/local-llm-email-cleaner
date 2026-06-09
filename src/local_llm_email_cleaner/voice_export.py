@@ -46,12 +46,20 @@ from .ingest.voice import VoiceMessage
 
 logger = logging.getLogger(__name__)
 
-_SELECT_SQL = """
+# Coarse prefilter derived from voice.VOICE_LABELS (the single source of truth)
+# so export and the `voice` rule can't drift on which labels count;
+# voice.parse_message (classify_kind) is the authoritative narrowing. SQLite
+# LIKE is case-insensitive for ASCII, so the lowercased labels match Takeout's
+# original-case labels (e.g. '%call log%' matches "Call log").
+_LABEL_PREFILTER = " OR ".join(
+    f"labels LIKE '%{label}%'" for label in sorted(voice.VOICE_LABELS)
+)
+
+_SELECT_SQL = f"""
 SELECT id, rfc_message_id, thread_id, labels, date_utc, date_epoch,
        from_addr, from_name, subject, body_text, has_attachments, attachment_names
 FROM messages
-WHERE labels IS NOT NULL
-  AND (labels LIKE '%SMS%' OR labels LIKE '%Call log%' OR labels LIKE '%Voicemail%')
+WHERE labels IS NOT NULL AND ({_LABEL_PREFILTER})
 ORDER BY id
 """
 
