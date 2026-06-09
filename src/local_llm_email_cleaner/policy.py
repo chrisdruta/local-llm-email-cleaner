@@ -7,6 +7,9 @@ Auto-trash (every condition must hold):
     AND not from a known contact
     AND not protected (financial/legal/security rules)
     AND older than auto_trash_min_age_months
+        (waived for ephemeral digests, which only need
+         auto_trash_ephemeral_min_age_days of grace — they are worthless once
+         their day passes; every other condition still applies)
     AND matches at least one deterministic candidate rule
 
 Auto-archive (laxer, because archiving is reversible and labeled in Gmail):
@@ -29,7 +32,7 @@ import logging
 import sqlite3
 
 from .config import Config
-from .ingest.headers import parse_epoch_to_age_cutoff
+from .ingest.headers import parse_epoch_to_age_cutoff, parse_epoch_to_age_cutoff_days
 from .models import LLM_CLASSIFIERS, sql_in_list
 
 logger = logging.getLogger(__name__)
@@ -61,7 +64,13 @@ WHERE review_status='pending'
   AND classified_by IN ({sql_in_list(LLM_CLASSIFIERS)})
   AND ai_confidence IS NOT NULL AND ai_confidence >= :min_confidence
   AND has_attachments = 0
-  AND date_epoch IS NOT NULL AND date_epoch < :age_cutoff
+  -- Age floor, waived for ephemeral digests (only a short grace applies — they
+  -- are worthless once their day passes). Everything else still needs the full
+  -- auto_trash_min_age_months.
+  AND date_epoch IS NOT NULL AND (
+        date_epoch < :age_cutoff
+        OR (ephemeral = 1 AND date_epoch < :ephemeral_age_cutoff)
+      )
   AND {_NOT_KNOWN_CONTACT}
   AND {_HAS_CANDIDATE_HIT}
   AND {_NOT_PROTECTED}
@@ -95,6 +104,9 @@ def apply_policy(conn: sqlite3.Connection, cfg: Config) -> dict[str, int]:
         {
             "min_confidence": cfg.auto_trash_min_confidence,
             "age_cutoff": parse_epoch_to_age_cutoff(cfg.auto_trash_min_age_months),
+            "ephemeral_age_cutoff": parse_epoch_to_age_cutoff_days(
+                cfg.auto_trash_ephemeral_min_age_days
+            ),
         },
     )
     auto_trashed = cursor.rowcount

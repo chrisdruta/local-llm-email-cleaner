@@ -29,6 +29,10 @@ user_addresses = []
 [policy]
 auto_trash_min_confidence = 0.90
 auto_trash_min_age_months = 12
+# Timely/recurring digests (daily Reddit, news/social roundups) are flagged
+# ephemeral and may auto-trash without the year-old floor above — they only
+# need this many days of grace (so you can still catch them in review first).
+auto_trash_ephemeral_min_age_days = 7
 # Archive auto-approval (reversible; archived mail gets [gmail].archive_label).
 # Applies to rule-staged archive candidates and, when the LLM weighed in, only
 # above this confidence. Set to a value > 1 to disable auto-archive entirely.
@@ -44,7 +48,5 @@ archive_label = "EmailCleaner/Archived"
 
 [voice]
 # `email-cleaner voice-export` writes Google Voice SMS / call-log backups here.
+# Staging those messages for trash is the `rules` stage's job (the `voice` rule).
 out_dir = "data/voice-export"
-# After exporting to disk, stage those messages for trash (still pending — they
-# go through normal review/approval first). Set false to back up only.
-trash_after_export = true

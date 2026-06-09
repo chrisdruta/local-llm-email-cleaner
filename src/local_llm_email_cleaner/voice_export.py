@@ -1,5 +1,4 @@
-"""Export Google Voice SMS / call-log messages to disk, then stage them for
-trash.
+"""Export Google Voice SMS / call-log messages to disk (backup only).
 
 Layout written under ``out_dir``:
 
@@ -23,11 +22,10 @@ preserve MMS pictures this re-reads the source mbox (located via
 If the mbox isn't reachable the text still exports and each affected record is
 flagged ``"exported": false`` rather than failing.
 
-After a successful write, exported messages are staged DELETE_CANDIDATE /
-``trash`` (still ``pending`` — they go through normal review/approval before
-anything is trashed) and tagged ``classified_by='voice'`` so the LLM
-classifier skips them. The on-disk files are rewritten in full on every run,
-so re-running is idempotent.
+This module only writes the disk backup; the on-disk files are rewritten in
+full on every run, so re-running is idempotent. Staging these messages for
+trash is the ``voice`` candidate rule's job (see ``rules/candidate_rules.py``)
+and happens in the ``rules`` stage, not here.
 """
 
 from __future__ import annotations
@@ -45,16 +43,8 @@ from .export import _sanitize_cell
 from .ingest import voice
 from .ingest.mbox_reader import iter_attachments
 from .ingest.voice import VoiceMessage
-from .models import (
-    CLASSIFIED_BY_VOICE,
-    ProposedAction,
-    RuleKind,
-    StagedLabel,
-)
 
 logger = logging.getLogger(__name__)
-
-VOICE_EXPORT_RULE = "voice_export"
 
 _SELECT_SQL = """
 SELECT id, rfc_message_id, thread_id, labels, date_utc, date_epoch,
@@ -74,8 +64,6 @@ _CALL_CSV_FIELDS = (
     "contact_number",
 )
 
-_CHUNK = 500  # keep SQL IN(...) under SQLite's variable limit
-
 #: contact_key -> (filename stem, display name, number)
 StemMap = dict[str, tuple[str, "str | None", "str | None"]]
 #: messages.id -> list of attachment record dicts
@@ -88,7 +76,6 @@ class VoiceExportStats:
     calls: int = 0
     voicemails: int = 0
     contacts: int = 0
-    staged_for_trash: int = 0
     attachments_saved: int = 0
     attachments_skipped: int = (
         0  # messages w/ attachments whose bytes weren't recovered
@@ -102,7 +89,6 @@ def export_voice(
     conn: sqlite3.Connection,
     out_dir: Path | str,
     *,
-    set_disposition: bool = True,
     include_attachments: bool = True,
     mbox_path: Path | str | None = None,
     progress: Callable[[int, int], None] | None = None,
@@ -140,12 +126,9 @@ def export_voice(
         out / "sms", sms, groups, stems, recovered, stats
     )
 
-    if set_disposition and messages:
-        stats.staged_for_trash = _stage_for_trash(conn, messages)
-
     logger.info(
         "Voice export: %d SMS, %d calls, %d voicemails across %d contacts -> %s "
-        "(%d attachments saved, %d skipped, %d staged for trash)",
+        "(%d attachments saved, %d skipped)",
         stats.sms,
         stats.calls,
         stats.voicemails,
@@ -153,7 +136,6 @@ def export_voice(
         out,
         stats.attachments_saved,
         stats.attachments_skipped,
-        stats.staged_for_trash,
     )
     return stats
 
@@ -389,64 +371,3 @@ def _write_transcripts(
         (sms_dir / f"{stem}.md").write_text("\n".join(lines), encoding="utf-8")
         written += 1
     return written
-
-
-# --- disposition ------------------------------------------------------------
-
-_DISPOSITION_SQL = f"""
-UPDATE messages
-SET staged_label='{StagedLabel.DELETE_CANDIDATE.value}',
-    proposed_action='{ProposedAction.TRASH.value}',
-    ai_category=?,
-    classified_by='{CLASSIFIED_BY_VOICE}'
-WHERE id=? AND review_status='pending'
-"""
-
-
-def _stage_for_trash(conn: sqlite3.Connection, messages: list[VoiceMessage]) -> int:
-    """Stage exported messages DELETE_CANDIDATE/trash (pending rows only, so an
-    already-approved or applied decision is never overwritten) and record a
-    'voice_export' candidate rule_hit for the audit trail. Idempotent."""
-    by_id = {m.message_id: m for m in messages}
-    ids = list(by_id)
-    staged = 0
-    for start in range(0, len(ids), _CHUNK):
-        chunk = ids[start : start + _CHUNK]
-        placeholders = ",".join("?" for _ in chunk)
-        pending = [
-            r[0]
-            for r in conn.execute(
-                f"SELECT id FROM messages WHERE id IN ({placeholders}) "
-                "AND review_status='pending'",
-                chunk,
-            )
-        ]
-        if not pending:
-            continue
-        conn.executemany(
-            _DISPOSITION_SQL,
-            [(f"voice_{by_id[i].kind}", i) for i in pending],
-        )
-        # Refresh the rule_hit so re-runs don't accumulate duplicates.
-        pend_ph = ",".join("?" for _ in pending)
-        conn.execute(
-            f"DELETE FROM rule_hits WHERE rule_name='{VOICE_EXPORT_RULE}' "
-            f"AND message_id IN ({pend_ph})",
-            pending,
-        )
-        conn.executemany(
-            "INSERT INTO rule_hits (message_id, rule_name, rule_kind, outcome) "
-            "VALUES (?, ?, ?, ?)",
-            [
-                (
-                    i,
-                    VOICE_EXPORT_RULE,
-                    RuleKind.CANDIDATE.value,
-                    StagedLabel.DELETE_CANDIDATE.value,
-                )
-                for i in pending
-            ],
-        )
-        staged += len(pending)
-    conn.commit()
-    return staged

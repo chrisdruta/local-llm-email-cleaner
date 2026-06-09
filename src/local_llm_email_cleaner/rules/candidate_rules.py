@@ -6,6 +6,7 @@ These only stage candidates — nothing is acted on without the policy gate
 
 from __future__ import annotations
 
+from ..ingest import voice as voice_ingest
 from ..models import RuleKind, RuleVote, StagedLabel
 from . import patterns
 from .views import MessageView, RuleContext
@@ -29,6 +30,17 @@ def receipt(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
 def updates_label(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
     if msg.labels & (patterns.UPDATES_LABELS | patterns.FORUMS_LABELS):
         return _vote("updates_label", StagedLabel.ARCHIVE_CANDIDATE, "notification")
+    return None
+
+
+def digest(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
+    # Timely/recurring digests (daily Reddit, news/social roundups) are
+    # disposable once their day passes. The engine treats a digest hit as
+    # ephemeral, so the policy gate may auto-trash it without the usual age
+    # floor (see rules/engine.py and policy.py).
+    sender_hit = msg.from_addr and patterns.DIGEST_SENDER_RE.search(msg.from_addr)
+    if sender_hit or patterns.DIGEST_SUBJECT_RE.search(msg.subject):
+        return _vote("digest", StagedLabel.DELETE_CANDIDATE, "digest")
     return None
 
 
@@ -70,6 +82,17 @@ def noreply_sender(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
     return None
 
 
+def voice(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
+    # Google Voice SMS / call-log / voicemail records (synthetic emails Takeout
+    # exports with an SMS / Call log / Voicemail label). `voice-export` backs
+    # them up to disk; here we stage them for trash. The engine special-cases
+    # this hit so it skips the LLM and never auto-approves — see rules/engine.py.
+    kind = voice_ingest.classify_kind(msg.labels)
+    if kind is not None:
+        return _vote("voice", StagedLabel.DELETE_CANDIDATE, f"voice_{kind}")
+    return None
+
+
 def newsletter_unsubscribe(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
     if msg.list_unsubscribe:
         return _vote(
@@ -81,11 +104,13 @@ def newsletter_unsubscribe(msg: MessageView, ctx: RuleContext) -> RuleVote | Non
 CANDIDATE_RULES = (
     receipt,
     updates_label,
+    digest,
     shipping,
     calendar,
     spam_label,
     promotional_label,
     social_label,
     noreply_sender,
+    voice,
     newsletter_unsubscribe,
 )

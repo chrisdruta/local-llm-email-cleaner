@@ -6,8 +6,18 @@ import csv
 
 from conftest import insert_message
 
-from local_llm_email_cleaner.export import export_actions
+from local_llm_email_cleaner.export import _sanitize_cell, export_actions
 from local_llm_email_cleaner.review import queries
+
+
+def test_sanitize_cell_neutralizes_all_formula_chars():
+    # The shared helper the CSV export AND the review-UI download both rely on.
+    for lead in ("=", "+", "-", "@", "\t", "\r"):
+        assert _sanitize_cell(f"{lead}danger") == f"'{lead}danger"
+    # Safe values and non-strings pass through untouched.
+    assert _sanitize_cell("normal text") == "normal text"
+    assert _sanitize_cell(0.95) == 0.95
+    assert _sanitize_cell(None) is None
 
 
 def test_export_writes_only_approved_actionable(conn, tmp_path):

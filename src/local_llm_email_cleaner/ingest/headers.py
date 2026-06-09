@@ -111,3 +111,13 @@ def parse_epoch_to_age_cutoff(months: int, now: datetime | None = None) -> int:
     now = now or datetime.now(UTC)
     # Approximate months as 30.44 days — precision is irrelevant for cleanup thresholds.
     return int(now.timestamp() - months * 30.44 * 86400)
+
+
+def parse_epoch_to_age_cutoff_days(days: int, now: datetime | None = None) -> int:
+    """Unix epoch for `days` ago; messages older than this pass age filters.
+
+    The fine-grained sibling of parse_epoch_to_age_cutoff, used for the short
+    ephemeral-digest grace period (policy.py).
+    """
+    now = now or datetime.now(UTC)
+    return int(now.timestamp() - days * 86400)

@@ -116,6 +116,29 @@ assert set(LABEL_FOR_LLM_ACTION) == {a.value for a in ProposedAction}, (
     "LABEL_FOR_LLM_ACTION keys must match ProposedAction values"
 )
 
+#: Canonical ai_category slugs. The LLM is constrained to these (Literal in
+#: llm/schema.py) so the column stays a small, groupable vocabulary instead of
+#: free text; the rules engine's candidate/protection categories are a subset
+#: (asserted in tests). "digest" marks timely/disposable roundups (see the
+#: `ephemeral` flag). Voice-export writes its own "voice_*" slugs directly and
+#: is intentionally outside this set.
+CATEGORIES: tuple[str, ...] = (
+    "promotion",
+    "newsletter",
+    "social",
+    "digest",
+    "notification",
+    "shipping",
+    "receipt",
+    "calendar",
+    "automated",
+    "spam",
+    "personal",
+    "security",
+    "financial_legal_medical",
+    "other",
+)
+
 
 @dataclass(frozen=True)
 class ParsedMessage:

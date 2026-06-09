@@ -47,7 +47,8 @@ logger = logging.getLogger(__name__)
 MAX_ATTEMPTS = 3
 
 _SELECT_SQL = """
-SELECT id, from_addr, from_name, subject, date_utc, labels, body_text, staged_label
+SELECT id, from_addr, from_name, subject, date_utc, labels, body_text, staged_label,
+       ephemeral
 FROM messages
 WHERE review_status='pending' AND ai_confidence IS NULL
   AND (
@@ -175,6 +176,9 @@ def _updates_for(row: sqlite3.Row, result: EmailClassification) -> tuple:
         staged = LABEL_FOR_LLM_ACTION[result.action]
         action = ProposedAction(result.action)
         classified_by = CLASSIFIED_BY_LLM
+    # OR semantics: never clear a deterministically-set ephemeral flag (the
+    # digest rule may have set it during the rules stage); the LLM can only add.
+    ephemeral = bool(row["ephemeral"]) or result.ephemeral
     return (
         staged.value,
         action.value,
@@ -182,6 +186,7 @@ def _updates_for(row: sqlite3.Row, result: EmailClassification) -> tuple:
         result.confidence,
         result.reason,
         classified_by,
+        int(ephemeral),
         row["id"],
     )
 
@@ -189,7 +194,7 @@ def _updates_for(row: sqlite3.Row, result: EmailClassification) -> tuple:
 _UPDATE_SQL = """
 UPDATE messages
 SET staged_label=?, proposed_action=?, ai_category=?, ai_confidence=?, ai_reason=?,
-    classified_by=?
+    classified_by=?, ephemeral=?
 WHERE id=?
 """
 

@@ -32,6 +32,13 @@ message, the safer it is to trash. (The cleanup system independently
 auto-trashes only mail older than a year, so you needn't be exact; but treat a
 clearly recent receipt or order as more likely still useful.)
 
+Timely/recurring digests are an exception to the age guidance: a daily Reddit
+digest, a news/social notification roundup, a "N new posts for you" email, or
+any periodic digest is worthless once its day passes — choose "trash" and set
+"ephemeral": true for these REGARDLESS of how recent they are. Set
+"ephemeral": false for everything else (it defaults to false). Do NOT mark
+genuine receipts, personal mail, or account/security notices as ephemeral.
+
 Distinguish topic from substance: junk and scam mail routinely *mentions*
 legal, tax, payment, or security matters as bait. The protections above are
 for genuine mail about the user's own affairs, not for promotions or scams

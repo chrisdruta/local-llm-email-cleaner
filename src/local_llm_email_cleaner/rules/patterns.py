@@ -15,6 +15,13 @@ SECURITY_SENDER_RE = re.compile(
     r"^(?:security|account-security|no-reply@accounts)", re.IGNORECASE
 )
 
+# Known senders of timely, recurring digests/roundups — no lasting value once
+# the day passes. Matched against the full from_addr. Add domains here.
+DIGEST_SENDER_RE = re.compile(
+    r"@(?:redditmail\.com|e?mail\.nextdoor\.com|.*\.substack\.com)$",
+    re.IGNORECASE,
+)
+
 # --- Gmail label sets (lowercased; Takeout uses e.g. "Category Promotions") --
 
 PROMO_LABELS = {"category promotions", "promotions"}
@@ -41,6 +48,15 @@ SHIPPING_SUBJECT_RE = re.compile(
 CALENDAR_SUBJECT_RE = re.compile(
     r"^(?:invitation:|accepted:|declined:|tentative:|updated\s+invitation:|"
     r"canceled(?:\s+event)?:|reminder:)",
+    re.IGNORECASE,
+)
+
+# Timely digests/roundups by subject shape (sender-agnostic backstop).
+DIGEST_SUBJECT_RE = re.compile(
+    r"\b(?:daily|weekly|monthly)\s+(?:digest|roundup|recap|briefing|newsletter)\b|"
+    r"\bdigest\b|\btop\s+(?:posts|stories)\b|"
+    r"\b\d+\s+new\s+(?:posts|stories|notifications|messages|replies)\b|"
+    r"\bwhat'?s\s+(?:new|happening|trending)\b|\bhighlights?\s+(?:for\s+you|this\s+week)\b",
     re.IGNORECASE,
 )
 

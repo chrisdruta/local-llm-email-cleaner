@@ -290,6 +290,7 @@ def insert_message(conn: sqlite3.Connection, **overrides) -> int:
         "attachment_names": "[]",
         "size_bytes": 1000,
         "list_unsubscribe": 0,
+        "ephemeral": 0,
         "ai_category": None,
         "ai_confidence": None,
         "ai_reason": None,

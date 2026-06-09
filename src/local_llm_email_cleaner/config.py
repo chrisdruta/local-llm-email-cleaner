@@ -41,6 +41,10 @@ user_addresses = [{user_addresses}]
 [policy]
 auto_trash_min_confidence = 0.90
 auto_trash_min_age_months = 12
+# Timely/recurring digests (daily Reddit, news/social roundups) are flagged
+# ephemeral and may auto-trash without the year-old floor above — they only
+# need this many days of grace (so you can still catch them in review first).
+auto_trash_ephemeral_min_age_days = 7
 # Archive auto-approval (reversible; archived mail gets [gmail].archive_label).
 # Applies to rule-staged archive candidates and, when the LLM weighed in, only
 # above this confidence. Set to a value > 1 to disable auto-archive entirely.
@@ -56,10 +60,8 @@ archive_label = "EmailCleaner/Archived"
 
 [voice]
 # `email-cleaner voice-export` writes Google Voice SMS / call-log backups here.
+# Staging those messages for trash is the `rules` stage's job (the `voice` rule).
 out_dir = "data/voice-export"
-# After exporting to disk, stage those messages for trash (still pending — they
-# go through normal review/approval first). Set false to back up only.
-trash_after_export = true
 """
 
 
@@ -82,6 +84,7 @@ class Config:
     # policy
     auto_trash_min_confidence: float
     auto_trash_min_age_months: int
+    auto_trash_ephemeral_min_age_days: int
     auto_archive_min_confidence: float
     # gmail
     oauth_port: int
@@ -90,7 +93,6 @@ class Config:
     archive_label: str
     # voice
     voice_out_dir: Path
-    voice_trash_after_export: bool
 
 
 DEFAULTS = Config(
@@ -107,13 +109,13 @@ DEFAULTS = Config(
     user_addresses=(),
     auto_trash_min_confidence=0.90,
     auto_trash_min_age_months=12,
+    auto_trash_ephemeral_min_age_days=7,
     auto_archive_min_confidence=0.80,
     oauth_port=8765,
     requests_per_second=5.0,
     uncertain_confidence_threshold=0.75,
     archive_label="EmailCleaner/Archived",
     voice_out_dir=Path("data/voice-export"),
-    voice_trash_after_export=True,
 )
 
 
@@ -146,6 +148,12 @@ def _from_toml(cfg: Config, data: dict) -> Config:
         auto_trash_min_age_months=int(
             policy.get("auto_trash_min_age_months", cfg.auto_trash_min_age_months)
         ),
+        auto_trash_ephemeral_min_age_days=int(
+            policy.get(
+                "auto_trash_ephemeral_min_age_days",
+                cfg.auto_trash_ephemeral_min_age_days,
+            )
+        ),
         auto_archive_min_confidence=float(
             policy.get("auto_archive_min_confidence", cfg.auto_archive_min_confidence)
         ),
@@ -160,9 +168,6 @@ def _from_toml(cfg: Config, data: dict) -> Config:
         ),
         archive_label=str(gmail.get("archive_label", cfg.archive_label)).strip(),
         voice_out_dir=Path(voice.get("out_dir", cfg.voice_out_dir)),
-        voice_trash_after_export=bool(
-            voice.get("trash_after_export", cfg.voice_trash_after_export)
-        ),
     )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from datetime import UTC, datetime, timedelta
 
 from conftest import FRIEND_ADDR, RECENT_DATE, add_rule_hit, insert_message
 
@@ -103,6 +104,59 @@ def test_spam_overridden_protection_is_review_only(conn, cfg):
 def test_gate_requires_llm_confidence(conn, cfg):
     # Rules-only rows (no LLM verdict) are never auto-approved.
     msg_id = eligible_row(conn, classified_by="rules", ai_confidence=None)
+    policy.apply_policy(conn, cfg)
+    assert status_of(conn, msg_id) == "pending"
+
+
+def test_ephemeral_recent_auto_trashes(conn, cfg):
+    # Recent (well past the 7-day grace, but far short of the 12-month floor),
+    # yet ephemeral: the age floor is waived, so it auto-trashes.
+    msg_id = eligible_row(
+        conn,
+        ephemeral=1,
+        date_utc=RECENT_DATE.isoformat(),
+        date_epoch=int(RECENT_DATE.timestamp()),
+    )
+    policy.apply_policy(conn, cfg)
+    assert status_of(conn, msg_id) == "auto_approved"
+
+
+def test_ephemeral_within_grace_not_trashed(conn, cfg):
+    # Inside the short grace window: even an ephemeral digest waits for review.
+    just_now = datetime.now(UTC) - timedelta(
+        days=2
+    )  # < auto_trash_ephemeral_min_age_days
+    msg_id = eligible_row(
+        conn,
+        ephemeral=1,
+        date_utc=just_now.isoformat(),
+        date_epoch=int(just_now.timestamp()),
+    )
+    policy.apply_policy(conn, cfg)
+    assert status_of(conn, msg_id) == "pending"
+
+
+def test_non_ephemeral_recent_still_blocked(conn, cfg):
+    # Same recent date but NOT ephemeral -> still blocked by the month floor.
+    msg_id = eligible_row(
+        conn,
+        ephemeral=0,
+        date_utc=RECENT_DATE.isoformat(),
+        date_epoch=int(RECENT_DATE.timestamp()),
+    )
+    policy.apply_policy(conn, cfg)
+    assert status_of(conn, msg_id) == "pending"
+
+
+def test_ephemeral_waives_only_age_not_other_conditions(conn, cfg):
+    # Ephemeral waives the age floor only; attachments still block auto-trash.
+    msg_id = eligible_row(
+        conn,
+        ephemeral=1,
+        has_attachments=1,
+        date_utc=RECENT_DATE.isoformat(),
+        date_epoch=int(RECENT_DATE.timestamp()),
+    )
     policy.apply_policy(conn, cfg)
     assert status_of(conn, msg_id) == "pending"
 

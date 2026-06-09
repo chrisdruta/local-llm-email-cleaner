@@ -101,8 +101,8 @@ pass a path to `ingest`) and run the pipeline in order:
 
 ```bash
 uv run email-cleaner ingest               # 1. stream-parse the MBOX into SQLite (creates the DB; idempotent)
-uv run email-cleaner rules                # 2. deterministic rules: protect, stage candidates
-uv run email-cleaner voice-export         # 2.5 OPTIONAL: back up Google Voice, stage it for trash
+uv run email-cleaner rules                # 2. deterministic rules: protect, stage candidates (incl. Google Voice)
+uv run email-cleaner voice-export         # 2.5 OPTIONAL: back up Google Voice to disk before it's trashed
 uv run email-cleaner classify             # 3. local LLM on ambiguous + delete candidates
 uv run email-cleaner policy               # 4. auto-approval gate (re-runnable after tuning)
 uv run email-cleaner review               # 5. Streamlit UI on :8501 — approve/reject
@@ -121,8 +121,11 @@ inspection (optional — not on the critical path).
 - `rules` runs *before* the LLM on purpose: protection rules pull
   known-contact / financial / security mail out so the LLM never sees it, and
   candidate rules stage the easy promos.
-- `voice-export`, if you use it, goes after `rules` but before `classify` — it
-  stages Voice messages and tags them so the classifier skips them.
+- `rules` also stages any Google Voice SMS / call-log / voicemail records for
+  trash (the `voice` rule) and tags them so the LLM classifier skips them.
+  `voice-export` is a *separate, optional* on-disk backup of those messages —
+  run it any time after `ingest` but **before `apply`** if you want to keep a
+  copy, since `apply` is what actually trashes them.
 - `classify` then only touches what rules left ambiguous (plus a second opinion
   on delete candidates).
 - `policy` is the *only* place auto-approval happens, so it runs after
@@ -141,13 +144,12 @@ recreates it) — you don't need to re-run `init`.
 
 If your mailbox includes Google Voice SMS / call-log emails (labelled `SMS` and
 `Call log`, with the other party as a synthetic `<number>@unknown.email`
-sender), `voice-export` backs them up to disk in a clean, re-importable form and
-then stages them for trash so they leave Gmail:
+sender), the `rules` stage stages them for trash (the `voice` rule), and
+`voice-export` backs them up to disk in a clean, re-importable form first:
 
 ```bash
 uv run email-cleaner voice-export                 # to [voice].out_dir (default data/voice-export)
 uv run email-cleaner voice-export --out /mnt/backup/voice
-uv run email-cleaner voice-export --no-trash      # back up only, leave Gmail untouched
 uv run email-cleaner voice-export --mbox path.mbox  # explicit source for attachment recovery
 uv run email-cleaner voice-export --no-attachments  # text only, skip image recovery
 ```
@@ -164,10 +166,14 @@ ingest record, or via `--mbox`) and recovers the images to
 the transcripts. If the MBOX isn't reachable, text still exports and the
 affected records are flagged `"exported": false`.
 
-Unless `--no-trash`, exported messages are staged `DELETE_CANDIDATE` (still
-`pending` — they go through the normal review/`apply` flow before anything is
-trashed) and tagged so the LLM classifier skips them. The output files are
-rewritten in full on every run, so it's safe to re-run.
+`voice-export` only writes the disk backup — it never touches the database.
+Staging Voice messages for trash is the `rules` stage's job: the `voice` rule
+stages them `DELETE_CANDIDATE` (still `pending` — they go through the normal
+review/`apply` flow before anything is trashed) and tags them so the LLM
+classifier skips them. The output files are rewritten in full on every run, so
+it's safe to re-run. **Run `voice-export` before `apply`** if you want the
+backup, since `rules` will stage these for trash whether or not you've exported
+them.
 
 Archiving removes the message from the Inbox but keeps it in All Mail, tagged
 with the `EmailCleaner/Archived` label (configurable via `[gmail]
@@ -183,9 +189,9 @@ mail stays easy to find — and bulk-undo — in Gmail.
    never known contacts — and the keyword hit is still recorded, so such
    messages can never be auto-approved, only approved by you in review.
 2. **Candidate rules**: promotional/social labels, Gmail's own `Spam` label,
-   noreply senders, shipping/calendar notifications, receipts,
-   `List-Unsubscribe` newsletters → staged as `DELETE_CANDIDATE` /
-   `ARCHIVE_CANDIDATE` / `UNSUBSCRIBE_CANDIDATE`.
+   noreply senders, shipping/calendar notifications, receipts, Google Voice
+   SMS / call-log / voicemail records, `List-Unsubscribe` newsletters → staged
+   as `DELETE_CANDIDATE` / `ARCHIVE_CANDIDATE` / `UNSUBSCRIBE_CANDIDATE`.
 3. **LLM** classifies what rules left ambiguous, and gives an independent
    second opinion (confidence score) on rule-staged **delete and archive**
    candidates. If the LLM disagrees with a delete candidate, it's demoted to

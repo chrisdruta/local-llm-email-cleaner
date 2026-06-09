@@ -18,7 +18,13 @@ import sqlite3
 from collections import Counter
 from dataclasses import dataclass
 
-from ..models import ACTION_FOR_LABEL, CLASSIFIED_BY_RULES, RuleVote, StagedLabel
+from ..models import (
+    ACTION_FOR_LABEL,
+    CLASSIFIED_BY_RULES,
+    CLASSIFIED_BY_VOICE,
+    RuleVote,
+    StagedLabel,
+)
 from . import patterns
 from .candidate_rules import CANDIDATE_RULES
 from .protection_rules import ABSOLUTE_PROTECTION_RULES, OVERRIDABLE_PROTECTION_RULES
@@ -39,6 +45,10 @@ class RuleResult:
     staged_label: StagedLabel
     category: str | None
     hits: tuple[RuleVote, ...]
+    ephemeral: bool = False
+    #: overrides the engine's default classified_by ('rules') for this row —
+    #: voice messages use 'voice' so the LLM classifier skips them.
+    classified_by: str | None = None
 
 
 def evaluate_message(msg: MessageView, ctx: RuleContext) -> RuleResult:
@@ -56,6 +66,34 @@ def evaluate_message(msg: MessageView, ctx: RuleContext) -> RuleResult:
     # Spam override: keyword protection hits are still recorded below, so the
     # policy gates can never auto-approve these — they always reach a human.
     candidate_hits = tuple(v for rule in CANDIDATE_RULES if (v := rule(msg, ctx)))
+
+    # Voice override: Google Voice SMS / call-log / voicemail records are
+    # synthetic emails, not real mail — they're backed up to disk by
+    # `voice-export` and always staged for trash. Tagged 'voice' so the LLM
+    # classifier skips them (it can't meaningfully judge a text message), which
+    # also keeps them out of the auto-trash gate (human review only).
+    voice_hit = next((v for v in candidate_hits if v.rule_name == "voice"), None)
+    if voice_hit is not None:
+        return RuleResult(
+            StagedLabel.DELETE_CANDIDATE,
+            voice_hit.category,
+            keyword_hits + candidate_hits,
+            classified_by=CLASSIFIED_BY_VOICE,
+        )
+
+    # Digest override: a timely/recurring digest is known-disposable, so it
+    # beats the normal "most conservative wins" precedence (a Reddit digest
+    # also hits updates_label -> ARCHIVE) and is marked ephemeral, letting the
+    # policy gate auto-trash it without the usual age floor. The LLM still gets
+    # the final say in `classify` (DELETE_CANDIDATEs are second-opinioned).
+    if any(v.rule_name == "digest" for v in candidate_hits):
+        return RuleResult(
+            StagedLabel.DELETE_CANDIDATE,
+            "digest",
+            keyword_hits + candidate_hits,
+            ephemeral=True,
+        )
+
     if candidate_hits:
         for label in _CANDIDATE_PRECEDENCE:
             winners = [v for v in candidate_hits if v.staged_label == label]
@@ -71,7 +109,7 @@ BATCH_SIZE = 500
 
 _UPDATE_SQL = """
 UPDATE messages
-SET staged_label=?, proposed_action=?, ai_category=?, classified_by=?
+SET staged_label=?, proposed_action=?, ai_category=?, classified_by=?, ephemeral=?
 WHERE id=?
 """
 
@@ -98,7 +136,7 @@ def run_rules(
         conn.execute(
             """
             UPDATE messages SET staged_label=NULL, proposed_action=NULL, ai_category=NULL,
-                   ai_confidence=NULL, ai_reason=NULL, classified_by=NULL
+                   ai_confidence=NULL, ai_reason=NULL, classified_by=NULL, ephemeral=0
             WHERE review_status = 'pending'
             """
         )
@@ -130,7 +168,7 @@ def run_rules(
         result = evaluate_message(view, ctx)
         counts[result.staged_label.value] += 1
 
-        classified_by = (
+        classified_by = result.classified_by or (
             CLASSIFIED_BY_RULES
             if result.staged_label != StagedLabel.NEEDS_REVIEW
             else None
@@ -141,6 +179,7 @@ def run_rules(
                 ACTION_FOR_LABEL[result.staged_label].value,
                 result.category,
                 classified_by,
+                int(result.ephemeral),
                 view.id,
             )
         )

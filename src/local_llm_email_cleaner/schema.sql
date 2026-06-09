@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS messages (
     size_bytes        INTEGER,
     list_unsubscribe  INTEGER NOT NULL DEFAULT 0,      -- List-Unsubscribe header present
     -- classification / decision columns
+    ephemeral         INTEGER NOT NULL DEFAULT 0,      -- timely/disposable digest: safe to trash regardless of age
     ai_category       TEXT,
     ai_confidence     REAL,
     ai_reason         TEXT,

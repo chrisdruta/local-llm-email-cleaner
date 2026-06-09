@@ -14,7 +14,7 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 
-from local_llm_email_cleaner import db
+from local_llm_email_cleaner import db, export
 from local_llm_email_cleaner.config import load_config
 from local_llm_email_cleaner.models import (
     ACTIONABLE_ACTIONS,
@@ -57,6 +57,19 @@ def df_query(
     conn: sqlite3.Connection, sql: str, params: tuple | dict = ()
 ) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn, params=params)
+
+
+def sanitized_csv(df: pd.DataFrame) -> bytes:
+    """CSV bytes with spreadsheet-formula injection neutralized (CWE-1236).
+
+    Reuses export._sanitize_cell so this download matches `email-cleaner
+    export`'s safety. Streamlit's built-in data_editor toolbar download cannot
+    be disabled programmatically — this explicit button is the safe export.
+    """
+    safe = df.drop(columns=["select"], errors="ignore").apply(
+        lambda col: col.map(export._sanitize_cell)
+    )
+    return safe.to_csv(index=False).encode("utf-8")
 
 
 #: Message-table display: important columns first; short labels and sized
@@ -144,6 +157,16 @@ def message_table_with_actions(
     if c4.button(f"Reject ALL shown ({len(all_ids)})", key=f"ra_{key}"):
         set_status(conn, all_ids, ReviewStatus.REJECTED.value)
         st.rerun()
+
+    st.download_button(
+        "Download CSV (sanitized)",
+        data=sanitized_csv(df),
+        file_name=f"{key}_export.csv",
+        mime="text/csv",
+        key=f"dl_{key}",
+        help="Formula-injection-safe export. Prefer this over the table "
+        "toolbar's built-in download.",
+    )
 
 
 def group_table_with_actions(

@@ -17,11 +17,19 @@ from local_llm_email_cleaner.llm.schema import EmailClassification
 
 
 def fake_chain(
-    action="trash", category="promotion", confidence=0.97, reason="old promo"
+    action="trash",
+    category="promotion",
+    confidence=0.97,
+    reason="old promo",
+    ephemeral=False,
 ):
     return RunnableLambda(
         lambda _inputs: EmailClassification(
-            action=action, category=category, confidence=confidence, reason=reason
+            action=action,
+            category=category,
+            confidence=confidence,
+            reason=reason,
+            ephemeral=ephemeral,
         )
     )
 
@@ -78,6 +86,27 @@ def test_keep_rows_not_selected(conn, cfg):
     assert stats.processed == 0
 
 
+def test_voice_delete_candidates_not_selected(conn, cfg):
+    # The `voice` rule stages these DELETE_CANDIDATE but tags them 'voice'
+    # (backed up to disk); the LLM can't meaningfully judge a text message, so
+    # the classifier must skip them. A rules-staged delete candidate still runs.
+    insert_message(
+        conn,
+        staged_label="DELETE_CANDIDATE",
+        proposed_action="trash",
+        classified_by="voice",
+    )
+    rule_id = insert_message(
+        conn,
+        staged_label="DELETE_CANDIDATE",
+        proposed_action="trash",
+        classified_by="rules",
+    )
+    stats = classifier.classify_messages(conn, cfg, fake_chain())
+    assert stats.processed == 1
+    assert row_of(conn, rule_id)["classified_by"] == "rules+llm"
+
+
 def archive_candidate(conn, **overrides) -> int:
     fields = dict(
         staged_label="ARCHIVE_CANDIDATE",
@@ -91,7 +120,9 @@ def archive_candidate(conn, **overrides) -> int:
 def test_archive_candidate_confirmed_by_llm(conn, cfg):
     # LLM agrees it's archive-worthy: stays archive, now with a confidence.
     msg_id = archive_candidate(conn)
-    classifier.classify_messages(conn, cfg, fake_chain(action="archive", confidence=0.85))
+    classifier.classify_messages(
+        conn, cfg, fake_chain(action="archive", confidence=0.85)
+    )
     row = row_of(conn, msg_id)
     assert row["staged_label"] == "ARCHIVE_CANDIDATE"
     assert row["proposed_action"] == "archive"
@@ -117,6 +148,43 @@ def test_archive_candidate_llm_disagreement_demotes_to_review(conn, cfg):
     assert row["staged_label"] == "NEEDS_REVIEW"
     assert row["proposed_action"] == "review"
     assert row["classified_by"] == "rules+llm"
+
+
+def test_llm_sets_ephemeral_flag(conn, cfg):
+    # An archive candidate the LLM judges a timely digest: escalated to trash
+    # AND marked ephemeral so the policy gate may waive the age floor.
+    msg_id = archive_candidate(conn)
+    classifier.classify_messages(
+        conn, cfg, fake_chain(action="trash", category="digest", ephemeral=True)
+    )
+    row = row_of(conn, msg_id)
+    assert row["staged_label"] == "DELETE_CANDIDATE"
+    assert row["proposed_action"] == "trash"
+    assert row["ephemeral"] == 1
+
+
+def test_ephemeral_or_semantics_never_cleared(conn, cfg):
+    # The rules stage already flagged this digest ephemeral; an LLM verdict that
+    # omits ephemeral must NOT clear it.
+    msg_id = archive_candidate(conn, ephemeral=1)
+    classifier.classify_messages(conn, cfg, fake_chain(action="trash", ephemeral=False))
+    assert row_of(conn, msg_id)["ephemeral"] == 1
+
+
+def test_non_ephemeral_classification_leaves_flag_zero(conn, cfg):
+    msg_id = insert_message(conn, staged_label="NEEDS_REVIEW", proposed_action="review")
+    classifier.classify_messages(conn, cfg, fake_chain(ephemeral=False))
+    assert row_of(conn, msg_id)["ephemeral"] == 0
+
+
+def test_classification_rejects_unknown_category():
+    # The category enum is constrained; an off-vocabulary slug is invalid.
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        EmailClassification(
+            action="trash", category="totally_made_up", confidence=0.9, reason="x"
+        )
 
 
 def test_failure_marks_row_for_human_review(conn, cfg, monkeypatch):

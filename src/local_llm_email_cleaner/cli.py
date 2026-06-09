@@ -259,11 +259,6 @@ def export_cmd(cfg: Config, out_path: str) -> None:
     help="Output directory (default: [voice].out_dir).",
 )
 @click.option(
-    "--no-trash",
-    is_flag=True,
-    help="Export to disk only; don't stage the messages for trash.",
-)
-@click.option(
     "--mbox",
     "mbox_path",
     type=click.Path(dir_okay=False),
@@ -279,15 +274,14 @@ def export_cmd(cfg: Config, out_path: str) -> None:
 def voice_export_cmd(
     cfg: Config,
     out_dir: str | None,
-    no_trash: bool,
     mbox_path: str | None,
     no_attachments: bool,
 ) -> None:
-    """Export Google Voice SMS / call logs to disk, then stage them for trash.
+    """Back up Google Voice SMS / call logs to disk (backup only).
 
-    Writes JSONL + per-contact transcripts + a calls CSV, recovers MMS images
-    from the source MBOX, then (unless --no-trash) stages the exported messages
-    DELETE_CANDIDATE for the normal review/apply flow. Re-runnable; the files
+    Writes JSONL + per-contact transcripts + a calls CSV and recovers MMS
+    images from the source MBOX. Staging these messages for trash is the
+    `rules` stage's job (the `voice` candidate rule). Re-runnable; the files
     are rewritten in full each time."""
     out = Path(out_dir) if out_dir else cfg.voice_out_dir
     conn = db.open_db(cfg.db_path)
@@ -304,7 +298,6 @@ def voice_export_cmd(
             stats = voice_export.export_voice(
                 conn,
                 out,
-                set_disposition=cfg.voice_trash_after_export and not no_trash,
                 include_attachments=not no_attachments,
                 mbox_path=mbox_path,
                 progress=progress,
@@ -324,13 +317,10 @@ def voice_export_cmd(
                 else ""
             )
         )
-    if stats.staged_for_trash:
-        click.echo(
-            f"Staged {stats.staged_for_trash} messages for trash "
-            "(pending review — run `email-cleaner review`, then `apply`)."
-        )
-    elif no_trash or not cfg.voice_trash_after_export:
-        click.echo("Backup only — no messages were staged for trash.")
+    click.echo(
+        "Backup only. Run `email-cleaner rules` to stage Voice messages for "
+        "trash (the `voice` rule)."
+    )
 
 
 @cli.command()
