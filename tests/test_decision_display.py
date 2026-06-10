@@ -85,4 +85,5 @@ def test_disagreement_awaits_human_decision(conn):
     text = summary_for(conn, mid)
     assert "**disagreed**" in text
     assert "trash vs keep" in text
+    assert "Awaiting your decision" in text
     assert "(undecided)" in text

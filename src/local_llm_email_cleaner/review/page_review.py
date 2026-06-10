@@ -33,6 +33,7 @@ _FILTER_KEYS = {
     "has_attachments": "flt_attach",
     "no_rule": "flt_no_rule",
     "disagreement": "flt_disagreement",
+    "needs_decision": "flt_needs_decision",
 }
 
 #: empty value each filter widget resets to (and the value a preset omits).
@@ -50,6 +51,7 @@ _FILTER_DEFAULTS: dict = {
     "has_attachments": False,
     "no_rule": False,
     "disagreement": False,
+    "needs_decision": False,
 }
 
 #: order key drives the server-side ORDER BY (the whole result set, not just
@@ -61,10 +63,7 @@ _ORDER_LABELS = {"default": "Newest first", "oldest": "Oldest first"}
 def _presets() -> dict[str, dict]:
     cfg = get_cfg()
     return {
-        "Needs attention": {
-            "review_status": [ReviewStatus.PENDING.value],
-            "action": [Action.REVIEW.value],
-        },
+        "Needs decision": {"needs_decision": True},
         "Disagreements": {"disagreement": True},
         "LLM uncertain": {"conf": (0.0, cfg.uncertain_confidence_threshold)},
         "No rule matched": {"no_rule": True},
@@ -124,6 +123,12 @@ def collect_filters() -> tuple[dict, str]:
         key=_FILTER_KEYS["disagreement"],
         help="The LLM contradicted the rule's verdict — prime rule-tuning input.",
     )
+    needs_decision = st.sidebar.checkbox(
+        "Needs your decision",
+        key=_FILTER_KEYS["needs_decision"],
+        help="Undecided rows with an LLM verdict: disagreements, LLM-unsure, "
+        "and failed classifications. Pick the action with the decide buttons.",
+    )
 
     # The combinable filters sit in a single horizontal row across the top.
     c = st.columns([1.4, 1.4, 1.4, 1.4, 1, 1, 1.2, 1.2, 0.7])
@@ -162,6 +167,7 @@ def collect_filters() -> tuple[dict, str]:
         "has_attachments": has_attachments,
         "no_rule": no_rule,
         "disagreement": disagreement,
+        "needs_decision": needs_decision,
     }
     # Only apply confidence bounds when the user narrowed the full 0–1 range.
     if conf_lo > 0.0:

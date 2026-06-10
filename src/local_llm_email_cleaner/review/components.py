@@ -15,7 +15,12 @@ import streamlit as st
 
 from local_llm_email_cleaner import db, export
 from local_llm_email_cleaner.config import load_config
-from local_llm_email_cleaner.models import ACTIONABLE_ACTIONS, ReviewStatus
+from local_llm_email_cleaner.models import (
+    ACTIONABLE_ACTIONS,
+    Action,
+    DecisionSource,
+    ReviewStatus,
+)
 from local_llm_email_cleaner.review import queries
 from local_llm_email_cleaner.rules.ruleset import (
     RulesConfigError,
@@ -46,10 +51,52 @@ def load_rules() -> tuple[RuleSet | None, RulesConfigError | None]:
 def set_status(conn: sqlite3.Connection, ids: list[int], status: str) -> int:
     if not ids:
         return 0
+    # Approving an undecided row (staged_action NULL) would be a silent no-op —
+    # the runner only executes concrete actions — so it's refused here; use the
+    # decide buttons (set_decision) for those. Rejecting undecided is fine
+    # ("leave it alone" needs no action). Applied rows are never overwritten.
+    guard = (
+        " AND staged_action IS NOT NULL"
+        if status == ReviewStatus.APPROVED.value
+        else ""
+    )
     cur = conn.executemany(
-        # Never overwrite rows the runner already applied.
-        "UPDATE messages SET review_status=? WHERE id=? AND review_status != ?",
+        "UPDATE messages SET review_status=? WHERE id=? AND review_status != ?" + guard,
         [(status, i, ReviewStatus.APPLIED.value) for i in ids],
+    )
+    conn.commit()
+    skipped = len(ids) - cur.rowcount
+    if skipped and status == ReviewStatus.APPROVED.value:
+        st.toast(
+            f"{skipped} undecided row(s) not approved — there is no action to "
+            "approve yet. Use the decide buttons instead."
+        )
+    return cur.rowcount
+
+
+def set_decision(conn: sqlite3.Connection, ids: list[int], action: str) -> int:
+    """A human picks (or overrides) the action: decided + approved in one step.
+
+    Free choice — overrides the rule's verdict, the LLM's, and any earlier
+    human pick alike; only rows the runner already applied are untouchable.
+    Bypasses the policy gates by design (you ARE the gate); the runner's
+    reconcile-before-act still applies at apply time.
+    """
+    if not ids:
+        return 0
+    cur = conn.executemany(
+        "UPDATE messages SET staged_action=?, decision_source=?, review_status=? "
+        "WHERE id=? AND review_status != ?",
+        [
+            (
+                action,
+                DecisionSource.HUMAN.value,
+                ReviewStatus.APPROVED.value,
+                i,
+                ReviewStatus.APPLIED.value,
+            )
+            for i in ids
+        ],
     )
     conn.commit()
     return cur.rowcount
@@ -168,6 +215,24 @@ def review_browser(conn: sqlite3.Connection, df: pd.DataFrame, key: str) -> None
         set_status(conn, all_ids, ReviewStatus.REJECTED.value)
         st.rerun()
 
+    # Human decision: pick the action yourself (free choice — not limited to
+    # the rule's or the LLM's vote). Decided rows are approved in one step.
+    d1, d2 = st.columns([1, 3])
+    chosen = d1.selectbox(
+        "Set action",
+        [a.value for a in Action if a != Action.REVIEW],
+        key=f"decide_pick_{key}",
+        label_visibility="collapsed",
+    )
+    if d2.button(
+        f"Decide: set '{chosen}' on selected ({len(selected_ids)}) — "
+        "approves them immediately",
+        key=f"decide_{key}",
+        disabled=not selected_ids,
+    ):
+        set_decision(conn, selected_ids, chosen)
+        st.rerun()
+
     # Export selected rows when any are selected; otherwise everything shown.
     export_df = view_df.iloc[sel] if sel else view_df
     csv_label = (
@@ -226,8 +291,10 @@ def decision_summary(row: sqlite3.Row, hits: list[sqlite3.Row]) -> str:
     if row["llm_action"] is None:
         if row["staged_action"] is None:
             lines.append("**LLM:** awaiting classification.")
-        elif row["decision_source"] == "rule":
+        elif row["decision_source"] == DecisionSource.RULE.value:
             lines.append("**LLM:** skipped — the rule decided alone.")
+        elif row["decision_source"] == DecisionSource.HUMAN.value:
+            lines.append("**LLM:** never weighed in — you decided directly.")
     else:
         conf = row["llm_confidence"]
         conf_txt = f" ({conf:.2f})" if conf is not None else ""
@@ -241,9 +308,14 @@ def decision_summary(row: sqlite3.Row, hits: list[sqlite3.Row]) -> str:
             else:
                 lines.append(
                     f"The LLM **disagreed** with the rule "
-                    f"({row['rule_action']} vs {row['llm_action']}) — routed to "
-                    f"human review."
+                    f"({row['rule_action']} vs {row['llm_action']})."
                 )
+
+    if row["staged_action"] is None and row["llm_action"] is not None:
+        lines.append(
+            "**Awaiting your decision** — use the buttons above to pick the "
+            "action (you are not limited to the two votes)."
+        )
 
     # Outcome
     lines.append(
@@ -291,6 +363,25 @@ def render_message_detail(
     if r.button("Reject this", key=f"dr_{key}_{msg_id}"):
         set_status(conn, [msg_id], ReviewStatus.REJECTED.value)
         st.rerun()
+
+    if row["review_status"] != ReviewStatus.APPLIED.value:
+        st.caption(
+            "Or decide the action yourself (free choice; approves immediately "
+            "and overrides any earlier verdict):"
+        )
+        cols = st.columns(3)
+        for col, choice in zip(cols, (Action.KEEP, Action.ARCHIVE, Action.TRASH)):
+            tags = []
+            if row["rule_action"] == choice.value:
+                tags.append("rule's pick")
+            if row["llm_action"] == choice.value:
+                tags.append("LLM's pick")
+            label = choice.value.capitalize() + (
+                f" ({', '.join(tags)})" if tags else ""
+            )
+            if col.button(label, key=f"dec_{choice.value}_{key}_{msg_id}"):
+                set_decision(conn, [msg_id], choice.value)
+                st.rerun()
 
     st.markdown(
         f"**From:** {row['from_addr'] or ''}  \n"
