@@ -324,7 +324,7 @@ def voice_export_cmd(
 
     Writes JSONL + per-contact transcripts + a calls CSV and recovers MMS
     images from the source MBOX. Staging these messages for trash is the
-    `rules` stage's job (the `voice` candidate rule). Re-runnable; the files
+    `rules` stage's job (the `voice` rule). Re-runnable; the files
     are rewritten in full each time."""
     out = Path(out_dir) if out_dir else cfg.voice_out_dir
     conn = db.open_db(cfg.db_path)

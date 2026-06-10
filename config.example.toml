@@ -8,6 +8,9 @@ db = "data/email.db"
 mbox = "data/takeout.mbox"
 credentials = "secrets/credentials.json"
 token = "secrets/token.json"
+# Deterministic staging rules (the user-tunable source of truth) — see the
+# comments in the file itself. Validate edits with `email-cleaner rules --check`.
+rules = "rules.toml"
 
 [ollama]
 # From inside the devcontainer, the Windows-host Ollama server is reachable via
@@ -37,6 +40,10 @@ auto_trash_ephemeral_min_age_days = 7
 # Applies to rule-staged archive candidates and, when the LLM weighed in, only
 # above this confidence. Set to a value > 1 to disable auto-archive entirely.
 auto_archive_min_confidence = 0.80
+# Let trash rules with confirm_with_llm = false auto-approve without any LLM
+# confidence. Off by default — rule-only trash (including Google Voice records)
+# then always needs explicit human approval in review.
+auto_trash_allow_rule_only = false
 
 [gmail]
 oauth_port = 8765
