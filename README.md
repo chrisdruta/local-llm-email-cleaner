@@ -137,10 +137,11 @@ inspection (optional — not on the critical path).
   `voice-export` is a *separate, optional* on-disk backup of those messages —
   run it any time after `ingest` but **before `apply`** if you want to keep a
   copy, since `apply` is what actually trashes them.
-- `classify` touches exactly the rows without a final action: messages no rule
-  matched (the LLM suggests the action) plus rule verdicts awaiting
-  confirmation. The LLM never sees the rule's verdict — agreement confirms it,
-  disagreement routes the message to human review.
+- `classify` touches exactly the undecided rows the rules left for it:
+  messages no rule matched (the LLM suggests the action) plus rule verdicts
+  awaiting confirmation. The LLM never sees the rule's verdict — agreement
+  confirms it; a disagreement (or an LLM "review" verdict) leaves the message
+  **undecided**, queued for you in the review UI.
 - `policy` is the *only* place auto-approval happens, so it runs after
   `classify` has produced confidence scores.
 - `review` → `apply` is the human gate, then the deterministic action runner.
@@ -211,11 +212,17 @@ mail stays easy to find — and bulk-undo — in Gmail.
    - `confirm_with_llm = true` (most cleanup rules) — the verdict is
      tentative until the LLM independently agrees.
    - neither — the rule decides alone (e.g. `voice`).
-2. **LLM** classifies every ruled message without a final action: rows no
-   rule matched (its suggestion stands) and rule verdicts awaiting
-   confirmation. It never sees the rule's verdict; agreement confirms the
-   action, any disagreement routes the message to human review.
-3. **Policy gates** auto-approve (tunable in `[policy]` config or live on the
+2. **LLM** classifies every undecided ruled message: rows no rule matched
+   (its suggestion stands) and rule verdicts awaiting confirmation. It never
+   sees the rule's verdict; agreement confirms the action, any disagreement
+   leaves the message undecided.
+3. **You** resolve the undecided queue (the Review page's "Needs decision"
+   preset): each message shows the rule's vote and the LLM's vote, and the
+   decide buttons let you side with either — or pick something else entirely
+   (keep/archive/trash, free choice). A decision is approved in one step and
+   bypasses the policy gates (you are the gate); the runner's
+   reconcile-before-act still applies.
+4. **Policy gates** auto-approve (tunable in `[policy]` config or live on the
    UI's Policy page, which previews exactly what would be approved):
    - **trash** only when *all* hold: staged by a trash rule AND confirmed by
      the LLM at confidence ≥ 0.90 — or, for messages **no rule matched**, the
