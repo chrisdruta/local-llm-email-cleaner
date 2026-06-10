@@ -169,9 +169,7 @@ class GatePreview:
     archive_sample: list[sqlite3.Row]
 
 
-_SAMPLE_COLS = (
-    "id, date_utc, from_addr, subject, rule_name, llm_confidence, llm_reason"
-)
+_SAMPLE_COLS = "id, date_utc, from_addr, subject, rule_name, llm_confidence, llm_reason"
 
 
 def preview_policy(

@@ -184,9 +184,7 @@ def classify_messages(
         # in-flight request finalizes.
         if isinstance(result, Exception):
             logger.error("Giving up on message %s: %s", row["id"], result)
-            conn.execute(
-                _FAILURE_SQL, (f"classification failed: {result}", row["id"])
-            )
+            conn.execute(_FAILURE_SQL, (f"classification failed: {result}", row["id"]))
             stats.failed += 1
         else:
             conn.execute(_UPDATE_SQL, _updates_for(row, result))

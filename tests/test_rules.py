@@ -132,7 +132,9 @@ class TestEvaluateAgainstDefaultRules:
         assert {"financial_legal_medical", "spam_label"} <= self.hit_names(view)
 
     def test_spam_never_outranks_known_contact(self):
-        winner = self.winner(make_view(from_addr=FRIEND_ADDR, labels=frozenset({"spam"})))
+        winner = self.winner(
+            make_view(from_addr=FRIEND_ADDR, labels=frozenset({"spam"}))
+        )
         assert winner.name == "known_contact"
 
     def test_promo_label_votes_trash(self):
@@ -189,7 +191,9 @@ class TestEvaluateAgainstDefaultRules:
 
     def test_voice_outranks_known_contact(self):
         # A leaked phone-number contact must not shield Voice records.
-        winner = self.winner(make_view(from_addr=FRIEND_ADDR, labels=frozenset({"sms"})))
+        winner = self.winner(
+            make_view(from_addr=FRIEND_ADDR, labels=frozenset({"sms"}))
+        )
         assert winner.name == "voice"
 
     def test_voice_outranks_other_labels(self):

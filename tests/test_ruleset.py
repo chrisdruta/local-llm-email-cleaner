@@ -148,17 +148,20 @@ def test_duplicate_names_rejected(tmp_path):
         # protect contradicts confirm_with_llm
         (
             '[[rules]]\nname="r"\nprotect=true\nconfirm_with_llm=true\n'
-            '[[rules.match]]\nknown_contact=true\n',
+            "[[rules.match]]\nknown_contact=true\n",
             "contradict",
         ),
         # protect forces keep
         (
             '[[rules]]\nname="r"\nprotect=true\naction="trash"\n'
-            '[[rules.match]]\nknown_contact=true\n',
+            "[[rules.match]]\nknown_contact=true\n",
             "must have action = 'keep'",
         ),
         # empty match block
-        ('[[rules]]\nname="r"\naction="trash"\n[[rules.match]]\n', "at least one criterion"),
+        (
+            '[[rules]]\nname="r"\naction="trash"\n[[rules.match]]\n',
+            "at least one criterion",
+        ),
         # no match blocks at all
         ('[[rules]]\nname="r"\naction="trash"\n', "match: Field required"),
         # unknown key (extra=forbid)
@@ -231,7 +234,11 @@ def test_priority_then_file_order(tmp_path):
         from_domain = ["a.com"]
         """,
     )
-    assert [r.name for r in ruleset.ordered_rules()] == ["tie_first", "tie_second", "low"]
+    assert [r.name for r in ruleset.ordered_rules()] == [
+        "tie_first",
+        "tie_second",
+        "low",
+    ]
 
 
 # --- matching semantics ---------------------------------------------------------
@@ -292,7 +299,8 @@ def test_subject_and_body_regex(tmp_path):
 
 def test_gmail_labels_any_of(tmp_path):
     rule = one_rule(
-        tmp_path, '[[rules.match]]\ngmail_labels = ["category promotions", "promotions"]\n'
+        tmp_path,
+        '[[rules.match]]\ngmail_labels = ["category promotions", "promotions"]\n',
     )
     assert rule.matches(view(labels=frozenset({"inbox", "category promotions"})), CTX)
     assert not rule.matches(view(labels=frozenset({"inbox"})), CTX)

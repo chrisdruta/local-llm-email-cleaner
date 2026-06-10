@@ -151,8 +151,10 @@ class RuleError:
 
     def __str__(self) -> str:
         where = f"rule '{self.rule}': " if self.rule else ""
-        return f"{where}{self.field}: {self.message}" if self.field else (
-            f"{where}{self.message}"
+        return (
+            f"{where}{self.field}: {self.message}"
+            if self.field
+            else (f"{where}{self.message}")
         )
 
 
@@ -173,7 +175,11 @@ def _rule_label(raw: dict, loc: tuple) -> tuple[str | None, str]:
     index = loc[1]
     rules = raw.get("rules", [])
     name = None
-    if isinstance(rules, list) and index < len(rules) and isinstance(rules[index], dict):
+    if (
+        isinstance(rules, list)
+        and index < len(rules)
+        and isinstance(rules[index], dict)
+    ):
         name = rules[index].get("name") or f"#{index + 1}"
     else:
         name = f"#{index + 1}"
@@ -205,10 +211,13 @@ def load_ruleset(path: Path) -> RuleSet:
             raw = tomllib.load(fh)
     except FileNotFoundError:
         raise RulesConfigError(
-            path, [RuleError(None, "", "rules file not found — run `email-cleaner init`")]
+            path,
+            [RuleError(None, "", "rules file not found — run `email-cleaner init`")],
         ) from None
     except tomllib.TOMLDecodeError as exc:
-        raise RulesConfigError(path, [RuleError(None, "", f"invalid TOML: {exc}")]) from None
+        raise RulesConfigError(
+            path, [RuleError(None, "", f"invalid TOML: {exc}")]
+        ) from None
 
     errors: list[RuleError] = []
     ruleset: RuleSet | None = None
