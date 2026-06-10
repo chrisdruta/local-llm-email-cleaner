@@ -9,7 +9,7 @@ keeps such messages out of the auto-approval gates (human review only).
 
 from __future__ import annotations
 
-from ..models import RuleKind, RuleVote, StagedLabel
+from ..models import KNOWN_CONTACT_RULE, RuleKind, RuleVote, StagedLabel
 from . import patterns
 from .views import MessageView, RuleContext
 
@@ -25,16 +25,19 @@ def _vote(name: str, category: str) -> RuleVote:
 
 def known_contact(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
     if ctx.is_known_contact(msg.from_addr):
-        return _vote("known_contact", "personal")
+        return _vote(KNOWN_CONTACT_RULE, "personal")
     return None
 
 
 # Protection scans BOTH subject and body: sensitive mail (a bank statement, a
 # lab result) often carries an innocuous subject with the substance only in the
-# body. Body matching deliberately over-protects — when in doubt we KEEP.
+# body. The body is matched against a STRICTER pattern than the subject (see
+# patterns.py) — bare keywords like "legal" or "reset your password" live in the
+# footer of nearly every promo, so the body needs an unambiguous multi-word
+# phrase. Keyword KEEPs are still double-checked by the LLM in `classify`.
 def financial_legal_medical(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
     if patterns.FINANCIAL_LEGAL_MEDICAL_RE.search(msg.subject) or (
-        msg.body_text and patterns.FINANCIAL_LEGAL_MEDICAL_RE.search(msg.body_text)
+        msg.body_text and patterns.FINANCIAL_LEGAL_MEDICAL_BODY_RE.search(msg.body_text)
     ):
         return _vote("financial_legal_medical", "financial_legal_medical")
     return None
@@ -42,7 +45,7 @@ def financial_legal_medical(msg: MessageView, ctx: RuleContext) -> RuleVote | No
 
 def security_alert(msg: MessageView, ctx: RuleContext) -> RuleVote | None:
     if patterns.SECURITY_RE.search(msg.subject) or (
-        msg.body_text and patterns.SECURITY_RE.search(msg.body_text)
+        msg.body_text and patterns.SECURITY_BODY_RE.search(msg.body_text)
     ):
         return _vote("security_alert", "security")
     if msg.from_addr and patterns.SECURITY_SENDER_RE.search(msg.from_addr):

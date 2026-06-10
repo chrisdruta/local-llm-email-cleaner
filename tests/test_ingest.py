@@ -99,6 +99,30 @@ def test_contacts_skipped_without_user_addresses(conn, mbox_path):
     assert contacts.derive_contacts(conn, ()) == 0
 
 
+def test_voice_numbers_not_derived_as_contacts(conn):
+    """An outbound Google Voice SMS (From the user, To `<num>@unknown.email`)
+    must not turn that synthetic number into a known contact — otherwise the
+    inbound Voice records would be shielded from the voice cleanup rule."""
+    from conftest import insert_message
+
+    insert_message(
+        conn,
+        from_addr=USER_ADDR,
+        to_all="+12164969651@unknown.email",
+        subject="SMS with Michael",
+        labels="SMS",
+    )
+    n = contacts.derive_contacts(conn, (USER_ADDR,))
+    assert n == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM contacts WHERE address=?",
+            ("+12164969651@unknown.email",),
+        ).fetchone()[0]
+        == 0
+    )
+
+
 def test_contacts_derived_with_unnormalized_user_address(conn, mbox_path):
     """Display-form / mixed-case config must still match Sent mail."""
     store.ingest_mbox(conn, mbox_path)

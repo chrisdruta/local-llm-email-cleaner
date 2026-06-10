@@ -60,11 +60,35 @@ DIGEST_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# --- protection patterns: matched against subject AND body (never auto-acted) -
+# --- protection patterns ----------------------------------------------------
+#
+# Two tiers per topic. The broad *_RE match the SUBJECT: a sensitive subject is
+# rarely an accident. The strict *_BODY_RE match the BODY, and are a deliberate
+# subset — only multi-word, unambiguous phrases that essentially never show up
+# in marketing boilerplate. The broad bare tokens ("legal", "insurance",
+# "benefits", "loan", "reset your password", ...) are exactly the words that
+# live in the legal/account footer of nearly every promo; matching them in a
+# body protected hundreds of newsletters and clearance blasts as "financial" or
+# "security", drowning the review queue. Genuine sensitive mail still carries
+# one of the strong phrases below in its body. Anything that slips past the
+# narrowed body match is caught downstream: keyword-protected KEEPs get a
+# second opinion from the LLM in `classify` (which can pull an obvious promo
+# back down to archive/trash for review).
 
 SECURITY_RE = re.compile(
     r"\b(?:security\s+alert|sign[\-\s]?in\s+(?:attempt|detected|from)|new\s+device|"
     r"password\s+(?:was\s+)?(?:changed|reset)|reset\s+your\s+password|"
+    r"verification\s+code|one[\-\s]?time\s+(?:pass(?:word|code)?|pin)|\botp\b|"
+    r"two[\-\s]?factor|\b2fa\b|login\s+attempt|suspicious\s+activity)",
+    re.IGNORECASE,
+)
+
+# Body subset: drops the marketing-footer offenders ("new device", a bare
+# "reset your password" CTA, an imperative "password reset"). Keeps past-tense
+# notifications ("password was changed/reset") and the unambiguous codes/terms.
+SECURITY_BODY_RE = re.compile(
+    r"\b(?:security\s+alert|sign[\-\s]?in\s+(?:attempt|detected|from)|"
+    r"password\s+was\s+(?:changed|reset)|"
     r"verification\s+code|one[\-\s]?time\s+(?:pass(?:word|code)?|pin)|\botp\b|"
     r"two[\-\s]?factor|\b2fa\b|login\s+attempt|suspicious\s+activity)",
     re.IGNORECASE,
@@ -76,5 +100,17 @@ FINANCIAL_LEGAL_MEDICAL_RE = re.compile(
     r"legal|lawyer|attorney|contract|lease|deed|notary|"
     r"medical|doctor|prescription|pharmacy|lab\s+result|diagnosis|appointment\s+(?:confirmed|reminder)|"
     r"mortgage|loan|payroll|salary|benefits|401\s?k|\bhsa\b|\bfsa\b)",
+    re.IGNORECASE,
+)
+
+# Body subset: drops the bare single words that pervade promo footers ("legal",
+# "insurance", "benefits", "loan", "mortgage", "contract", "lease", a lone
+# "tax"). Keeps multi-word phrases specific to the user's own records.
+FINANCIAL_LEGAL_MEDICAL_BODY_RE = re.compile(
+    r"\b(?:tax\s+(?:return|document|form)|\birs\b|w-?2\b|1099|"
+    r"account\s+statement|bank\s+statement|mortgage\s+statement|"
+    r"policy\s+(?:number|renewal|document)|claim\s+(?:status|number)|"
+    r"explanation\s+of\s+benefits|lab\s+result|diagnosis|prescription|"
+    r"loan\s+(?:application|statement|agreement)|payroll|401\s?k|\bhsa\b|\bfsa\b)",
     re.IGNORECASE,
 )

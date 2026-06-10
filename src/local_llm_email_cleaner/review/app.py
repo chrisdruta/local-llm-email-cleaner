@@ -13,6 +13,7 @@ full email body in a detail panel below the table.
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import sqlite3
@@ -30,6 +31,7 @@ from local_llm_email_cleaner.models import (
     StagedLabel,
 )
 from local_llm_email_cleaner.review import queries
+from local_llm_email_cleaner.review.trace import build_decision_trace
 
 st.set_page_config(page_title="email-cleaner review", layout="wide")
 
@@ -125,6 +127,8 @@ _FILTER_KEYS = {
     "staged_label": "flt_label",
     "ai_category": "flt_category",
     "conf": "flt_conf",
+    "date_from": "flt_date_from",
+    "date_to": "flt_date_to",
     "from_addr": "flt_from",
     "from_domain": "flt_domain",
     "has_attachments": "flt_attach",
@@ -138,13 +142,20 @@ _FILTER_DEFAULTS: dict = {
     "staged_label": [],
     "ai_category": [],
     "conf": (0.0, 1.0),
+    "date_from": None,
+    "date_to": None,
     "from_addr": "",
     "from_domain": "",
     "has_attachments": False,
 }
 
-#: order override is not a widget; presets set it and a normal browse clears it.
+#: order key drives the server-side ORDER BY (the whole result set, not just
+#: the grid's capped page). Presets pre-set it; the Sort selectbox reads/writes it.
 _ORDER_KEY = "flt_order"
+
+#: order value -> human label for the Sort selectbox. Keys must stay in the
+#: allowlist understood by queries.build_message_query.
+_ORDER_LABELS = {"default": "Newest first", "oldest": "Oldest first"}
 
 #: Named presets → the widget values they apply. Each maps a subset of
 #: _FILTER_KEYS; unlisted widgets are reset to their empty default.
@@ -183,8 +194,10 @@ def _clear_filters() -> None:
 
 
 def collect_filters() -> tuple[dict, str]:
-    """Render the Review sidebar (presets + combinable filters); return
-    (filters dict for the query builder, order key)."""
+    """Render the Review filter bar across the top of the page (presets, sort,
+    and combinable filters); return (filters dict for the query builder, order
+    key)."""
+    # Presets, sort, search and confidence live in the sidebar.
     st.sidebar.subheader("Presets")
     cols = st.sidebar.columns(2)
     for i, name in enumerate(_PRESETS):
@@ -195,34 +208,45 @@ def collect_filters() -> tuple[dict, str]:
         _clear_filters()
         st.rerun()
 
-    st.sidebar.subheader("Filters")
+    st.sidebar.subheader("Sort")
+    # Server-side sort over the whole result set — the grid's own column-header
+    # sort only reorders the capped page it already holds.
+    st.sidebar.selectbox(
+        "Order by date",
+        list(_ORDER_LABELS),
+        format_func=_ORDER_LABELS.get,
+        key=_ORDER_KEY,
+    )
+
+    st.sidebar.subheader("Search")
     fts = st.sidebar.text_input("Full-text search (FTS5)", key=_FILTER_KEYS["fts"])
-    review_status = st.sidebar.multiselect(
-        "Review status",
-        [s.value for s in ReviewStatus],
-        key=_FILTER_KEYS["review_status"],
-    )
-    proposed_action = st.sidebar.multiselect(
-        "Proposed action",
-        [a.value for a in ProposedAction],
-        key=_FILTER_KEYS["proposed_action"],
-    )
-    staged_label = st.sidebar.multiselect(
-        "Staged label", [s.value for s in StagedLabel], key=_FILTER_KEYS["staged_label"]
-    )
-    ai_category = st.sidebar.multiselect(
-        "Category", list(CATEGORIES), key=_FILTER_KEYS["ai_category"]
-    )
     conf_lo, conf_hi = st.sidebar.slider(
         "Confidence range", 0.0, 1.0, (0.0, 1.0), 0.05, key=_FILTER_KEYS["conf"]
     )
-    from_addr = st.sidebar.text_input("Sender contains", key=_FILTER_KEYS["from_addr"])
-    from_domain = st.sidebar.text_input(
-        "Domain contains", key=_FILTER_KEYS["from_domain"]
+
+    # The combinable filters sit in a single horizontal row across the top.
+    # Short labels keep all nine controls on one line; multiselects/dates get a
+    # little extra width, the attachments checkbox the least.
+    c = st.columns([1.4, 1.4, 1.4, 1.4, 1, 1, 1.2, 1.2, 0.7])
+    review_status = c[0].multiselect(
+        "Status", [s.value for s in ReviewStatus], key=_FILTER_KEYS["review_status"]
     )
-    has_attachments = st.sidebar.checkbox(
-        "Has attachments", key=_FILTER_KEYS["has_attachments"]
+    proposed_action = c[1].multiselect(
+        "Action", [a.value for a in ProposedAction], key=_FILTER_KEYS["proposed_action"]
     )
+    staged_label = c[2].multiselect(
+        "Staged", [s.value for s in StagedLabel], key=_FILTER_KEYS["staged_label"]
+    )
+    ai_category = c[3].multiselect(
+        "Category", list(CATEGORIES), key=_FILTER_KEYS["ai_category"]
+    )
+    date_from = c[4].date_input(
+        "From (UTC)", value=None, key=_FILTER_KEYS["date_from"]
+    )
+    date_to = c[5].date_input("To (UTC)", value=None, key=_FILTER_KEYS["date_to"])
+    from_addr = c[6].text_input("Sender", key=_FILTER_KEYS["from_addr"])
+    from_domain = c[7].text_input("Domain", key=_FILTER_KEYS["from_domain"])
+    has_attachments = c[8].checkbox("Attach", key=_FILTER_KEYS["has_attachments"])
 
     filters: dict = {
         "fts": fts,
@@ -239,6 +263,13 @@ def collect_filters() -> tuple[dict, str]:
         filters["conf_lo"] = conf_lo
     if conf_hi < 1.0:
         filters["conf_hi"] = conf_hi
+
+    # Dates are stored as unix seconds (date_epoch). Treat each picked day as a
+    # full UTC day: from = its midnight, to = inclusive through its last second.
+    if date_from is not None:
+        filters["date_from"] = calendar.timegm(date_from.timetuple())
+    if date_to is not None:
+        filters["date_to"] = calendar.timegm(date_to.timetuple()) + 86399
 
     order = st.session_state.get(_ORDER_KEY, "default")
     return filters, order
@@ -304,9 +335,16 @@ def review_browser(conn: sqlite3.Connection, df: pd.DataFrame, key: str) -> None
         set_status(conn, all_ids, ReviewStatus.REJECTED.value)
         st.rerun()
 
+    # Export selected rows when any are selected; otherwise everything shown.
+    export_df = view_df.iloc[sel] if sel else view_df
+    csv_label = (
+        f"Download selected CSV ({len(sel)})"
+        if sel
+        else f"Download CSV ({len(all_ids)})"
+    )
     st.download_button(
-        "Download CSV (sanitized)",
-        data=sanitized_csv(view_df),
+        f"{csv_label} (sanitized)",
+        data=sanitized_csv(export_df),
         file_name=f"{key}_export.csv",
         mime="text/csv",
         key=f"dl_{key}",
@@ -383,6 +421,8 @@ def render_message_detail(
     if not hits.empty:
         st.caption("Rule hits")
         st.dataframe(hits, hide_index=True)
+    with st.expander("Decision trace", expanded=False):
+        st.markdown(build_decision_trace(conn, row).to_markdown())
     history = df_query(conn, queries.ACTIONS_FOR_MESSAGE, (msg_id,))
     if not history.empty:
         st.caption("Action history")
@@ -473,9 +513,11 @@ def page_review(conn: sqlite3.Connection) -> None:
         total = conn.execute(count_sql, count_params).fetchone()[0]
         df = df_query(conn, sql, params)
         if total > len(df):
+            edge = "oldest" if order == "oldest" else "newest"
             st.caption(
-                f"Showing newest {len(df)} of {total} matching messages "
-                f"({queries.BROWSER_LIMIT}-row cap)."
+                f"Showing {edge} {len(df)} of {total} matching messages "
+                f"({queries.BROWSER_LIMIT}-row cap). Narrow the date range to "
+                f"see messages beyond the cap."
             )
         else:
             st.caption(f"{total} matching messages.")

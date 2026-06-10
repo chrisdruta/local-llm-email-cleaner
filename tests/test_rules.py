@@ -70,6 +70,53 @@ class TestEvaluateMessage:
         )
         assert result.staged_label == StagedLabel.KEEP
 
+    def test_financial_body_ignores_promo_footer_keywords(self):
+        # A clearance promo whose body only carries bare footer words ("legal",
+        # "insurance", a lone "tax", "benefits") must NOT be protected — the
+        # body match needs an unambiguous multi-word phrase. With no candidate
+        # rule firing either, it falls through to NEEDS_REVIEW (the LLM decides).
+        result = engine.evaluate_message(
+            make_view(
+                from_addr="deals@wayfair.example",
+                subject="🔴 MEMORIAL DAY CLEARANCE 🔴",
+                body_text=(
+                    "Shop our best deals! 0% financing available. See our legal "
+                    "terms. Tax-free weekend. Member benefits apply. Insurance "
+                    "not included."
+                ),
+            ),
+            self.ctx,
+        )
+        assert result.staged_label == StagedLabel.NEEDS_REVIEW
+
+    def test_security_body_ignores_reset_password_cta(self):
+        # The account-management CTA "reset your password" pervades promo
+        # footers; on its own in the body it must not protect a marketing blast.
+        result = engine.evaluate_message(
+            make_view(
+                from_addr="hello@alphalete.example",
+                subject="A tee you buy twice 🔥",
+                body_text=(
+                    "New drop is live! Manage your account or reset your password "
+                    "any time from your profile."
+                ),
+            ),
+            self.ctx,
+        )
+        assert result.staged_label == StagedLabel.NEEDS_REVIEW
+
+    def test_security_body_still_protects_password_change_notice(self):
+        # The narrowed body pattern keeps the genuine past-tense notification.
+        result = engine.evaluate_message(
+            make_view(
+                from_addr="noreply@service.example",
+                subject="A note for you",
+                body_text="Your password was changed on a new device.",
+            ),
+            self.ctx,
+        )
+        assert result.staged_label == StagedLabel.KEEP
+
     def test_protection_beats_candidates(self):
         # A promo from a known contact stays KEEP.
         result = engine.evaluate_message(
@@ -204,13 +251,18 @@ class TestEvaluateMessage:
         assert result.category == "voice_sms"
         assert result.classified_by == CLASSIFIED_BY_VOICE
 
-    def test_voice_never_overrides_protection(self):
-        # A voice record from a known contact stays KEEP (protection runs first).
+    def test_voice_overrides_protection(self):
+        # A Voice record is decided before protection: even when the (synthetic
+        # `unknown.email`) number leaked into the contacts, it still trashes as
+        # voice rather than being shielded as a known contact.
         result = engine.evaluate_message(
             make_view(from_addr=FRIEND_ADDR, labels=frozenset({"sms"})), self.ctx
         )
-        assert result.staged_label == StagedLabel.KEEP
-        assert result.classified_by is None
+        assert result.staged_label == StagedLabel.DELETE_CANDIDATE
+        assert result.category == "voice_sms"
+        assert result.classified_by == CLASSIFIED_BY_VOICE
+        # The shielding known_contact protection is not even recorded.
+        assert not any(h.rule_name == "known_contact" for h in result.hits)
 
 
 def test_select_candidate_is_priority_then_precedence():
@@ -287,6 +339,17 @@ def test_rule_categories_are_canonical():
         assert vote is not None
         seen.add(vote.category)
     assert seen <= set(CATEGORIES), seen - set(CATEGORIES)
+
+
+def test_every_rule_has_a_rationale():
+    """RULE_RATIONALE must cover exactly the live rules — no missing entry (a new
+    rule shipped without a rationale) and no stale one (a removed rule)."""
+    from local_llm_email_cleaner.rules.candidate_rules import CANDIDATE_RULES
+    from local_llm_email_cleaner.rules.protection_rules import PROTECTION_RULES
+    from local_llm_email_cleaner.rules.rationale import RULE_RATIONALE
+
+    rule_names = {fn.__name__ for fn in PROTECTION_RULES + CANDIDATE_RULES}
+    assert set(RULE_RATIONALE) == rule_names
 
 
 def test_run_rules_end_to_end(conn, mbox_path, cfg):

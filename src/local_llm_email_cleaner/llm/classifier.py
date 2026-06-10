@@ -1,12 +1,17 @@
 """Batched, resumable LLM classification over the SQLite corpus.
 
-Three populations get an LLM verdict:
+Four populations get an LLM verdict:
 - rule-ambiguous messages (staged NEEDS_REVIEW, untouched by rules);
 - rule-staged DELETE_CANDIDATEs, which need an independent LLM confidence
-  before the auto-trash policy gate may fire; and
+  before the auto-trash policy gate may fire;
 - rule-staged ARCHIVE_CANDIDATEs, for the same second-opinion confidence
   before auto-archive — the LLM may also escalate one to trash, or pull it
-  back to human review if it disagrees.
+  back to human review if it disagrees; and
+- keyword-protected KEEPs (a financial/security keyword rule fired). Those
+  rules over-match promo footers, so the LLM re-checks them and may pull an
+  obvious promo down to archive/trash/review. The protection rule_hit stays on
+  the row, so a downgrade can never auto-approve — it only routes to a human.
+  KEEPs from a known contact (the one absolute protection) are not in scope.
 
 Requests are fanned out cfg.llm_concurrency at a time on our own thread
 pool (chain.invoke per message — equivalent to LangChain's batch(), which
@@ -140,38 +145,43 @@ def _batch_with_retry(
     return results
 
 
+# A rule-staged row gets the LLM as a SECOND OPINION; each staged label declares
+# which LLM verdicts it accepts. An accepted verdict is applied as-is (mapped by
+# LABEL_FOR_LLM_ACTION); any other verdict is a disagreement and the row falls
+# back to human review. DELETE_CANDIDATE accepts only a confirming 'trash';
+# ARCHIVE_CANDIDATE also lets the LLM escalate to 'trash' (handed to the stricter
+# auto-trash gate). Labels absent here — KEEP (a keyword-protection second
+# opinion that may pull an over-protected promo down) — accept every verdict,
+# exactly like a primary NEEDS_REVIEW row: the LLM moves the message wherever it
+# judges. A downgraded KEEP keeps its protection rule_hit, so the policy gate's
+# not-protected check still routes it to a human rather than auto-approving.
+_ACCEPTED_LLM_ACTIONS: dict[str, frozenset[str]] = {
+    StagedLabel.DELETE_CANDIDATE.value: frozenset({ProposedAction.TRASH.value}),
+    StagedLabel.ARCHIVE_CANDIDATE.value: frozenset(
+        {ProposedAction.ARCHIVE.value, ProposedAction.TRASH.value}
+    ),
+}
+
+
 def _updates_for(row: sqlite3.Row, result: EmailClassification) -> tuple:
     """Compute the column updates for one classified row."""
-    if row["staged_label"] == StagedLabel.DELETE_CANDIDATE.value:
-        # Rules already staged this for deletion; the LLM is a second opinion.
-        if result.action == ProposedAction.TRASH.value:
-            staged = StagedLabel.DELETE_CANDIDATE
-            action = ProposedAction.TRASH
-        else:
-            # Disagreement -> conservative: back to human review.
-            staged = StagedLabel.NEEDS_REVIEW
-            action = ProposedAction.REVIEW
-        classified_by = CLASSIFIED_BY_RULES_LLM
-    elif row["staged_label"] == StagedLabel.ARCHIVE_CANDIDATE.value:
-        # Rules staged this for archive; the LLM is a second opinion that may
-        # escalate to trash, agree (archive), or pull it back to review.
-        if result.action == ProposedAction.TRASH.value:
-            # Escalation: hand it to the stricter auto-trash gate, which still
-            # independently enforces age / no-attachments / confidence >= 0.90.
-            staged = StagedLabel.DELETE_CANDIDATE
-            action = ProposedAction.TRASH
-        elif result.action == ProposedAction.ARCHIVE.value:
-            staged = StagedLabel.ARCHIVE_CANDIDATE
-            action = ProposedAction.ARCHIVE
-        else:
-            # keep / review -> conservative: back to human review.
-            staged = StagedLabel.NEEDS_REVIEW
-            action = ProposedAction.REVIEW
-        classified_by = CLASSIFIED_BY_RULES_LLM
+    staged_in = row["staged_label"]
+    accepted = _ACCEPTED_LLM_ACTIONS.get(staged_in)  # None => accept all
+    if accepted is not None and result.action not in accepted:
+        # Disagreement with the rule's staging -> conservative: human review.
+        staged = StagedLabel.NEEDS_REVIEW
+        action = ProposedAction.REVIEW
     else:
         staged = LABEL_FOR_LLM_ACTION[result.action]
         action = ProposedAction(result.action)
-        classified_by = CLASSIFIED_BY_LLM
+    # NEEDS_REVIEW is the only population the rules left unjudged, so the LLM is
+    # its sole classifier; every other staged label means rules + LLM both
+    # weighed in (recorded as rules+llm), regardless of the verdict.
+    classified_by = (
+        CLASSIFIED_BY_LLM
+        if staged_in == StagedLabel.NEEDS_REVIEW.value
+        else CLASSIFIED_BY_RULES_LLM
+    )
     # AND semantics: the age-floor waiver requires BOTH signals — the digest
     # rule must have set ephemeral during the rules stage (deterministic) AND
     # the LLM must confirm it. A non-digest row (ephemeral=0) can never become

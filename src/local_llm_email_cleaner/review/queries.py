@@ -107,6 +107,7 @@ def _message_where(filters: dict) -> tuple[str, list]:
         staged_label    : list[str]  -> staged_label IN (...)
         ai_category     : list[str]  -> ai_category IN (...)
         conf_lo, conf_hi: float      -> LLM-classified AND ai_confidence >=/<= ?
+        date_from, date_to: int      -> date_epoch >=/<= ? (unix seconds, UTC)
         from_addr       : str        -> from_addr LIKE %term%
         from_domain     : str        -> from_domain LIKE %term%
         has_attachments : bool       -> has_attachments = 1 (only when True)
@@ -143,6 +144,17 @@ def _message_where(filters: dict) -> tuple[str, list]:
         if hi is not None:
             where.append("ai_confidence <= ?")
             params.append(hi)
+
+    # Date range bounds the whole result set server-side (epoch seconds, UTC),
+    # so sorting/scoping by date works across the entire DB — not just the
+    # capped page the grid happens to hold.
+    date_from, date_to = filters.get("date_from"), filters.get("date_to")
+    if date_from is not None:
+        where.append("date_epoch >= ?")
+        params.append(date_from)
+    if date_to is not None:
+        where.append("date_epoch <= ?")
+        params.append(date_to)
 
     for col in ("from_addr", "from_domain"):
         term = (filters.get(col) or "").strip()

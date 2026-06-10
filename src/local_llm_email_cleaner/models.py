@@ -75,10 +75,21 @@ CLASSIFIED_BY_VOICE = "voice"
 #: "seen by the LLM" is filtered — equality to 'llm' alone would be a bug)
 LLM_CLASSIFIERS: tuple[str, ...] = (CLASSIFIED_BY_LLM, CLASSIFIED_BY_RULES_LLM)
 
+#: rule_name of the sole ABSOLUTE protection rule. Keyword-protected KEEPs get
+#: a second opinion from the LLM (the financial/security keyword rules over-
+#: match promo footers), but a known contact is never reviewed back down. Shared
+#: so protection_rules and the classifier predicate can't drift on the name.
+KNOWN_CONTACT_RULE = "known_contact"
+
 #: The population the LLM classifier processes: rule-ambiguous rows (NEEDS_REVIEW
-#: with no classification yet) plus rule-staged delete/archive candidates that
-#: still need a second opinion — excluding voice rows (decided by the export,
-#: backed up to disk) and anything already scored. Lives here, not in the
+#: with no classification yet); rule-staged delete/archive candidates that still
+#: need a second opinion; and keyword-protected KEEPs (a financial/security
+#: keyword rule fired, but those rules over-match promo footers, so the LLM
+#: re-checks them — it may pull an obvious promo down to archive/trash, which
+#: still reaches a human because the protection rule_hit keeps it out of the
+#: auto-approval gates). Excludes voice rows (decided by the export, backed up
+#: to disk), KEEPs from a known contact (the one absolute protection — never
+#: reviewed down), and anything already scored. Lives here, not in the
 #: langchain-importing classifier module, so `status` can count the SAME
 #: predicate without paying that import; the two must never drift on what
 #: "awaiting LLM classification" means.
@@ -88,6 +99,11 @@ review_status='pending' AND ai_confidence IS NULL
         (staged_label=:needs_review AND classified_by IS NULL)
      OR ((staged_label=:delete_candidate OR staged_label=:archive_candidate)
          AND classified_by IS NOT :voice)
+     OR (staged_label=:keep
+         AND EXISTS (SELECT 1 FROM rule_hits h
+                     WHERE h.message_id = messages.id AND h.rule_kind = 'protection')
+         AND NOT EXISTS (SELECT 1 FROM rule_hits h
+                     WHERE h.message_id = messages.id AND h.rule_name = :known_contact))
   )
 """
 
@@ -98,7 +114,9 @@ def pending_classification_params() -> dict[str, str]:
         "needs_review": StagedLabel.NEEDS_REVIEW.value,
         "delete_candidate": StagedLabel.DELETE_CANDIDATE.value,
         "archive_candidate": StagedLabel.ARCHIVE_CANDIDATE.value,
+        "keep": StagedLabel.KEEP.value,
         "voice": CLASSIFIED_BY_VOICE,
+        "known_contact": KNOWN_CONTACT_RULE,
     }
 
 

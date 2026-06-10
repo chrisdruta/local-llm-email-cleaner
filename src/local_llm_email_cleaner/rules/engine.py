@@ -1,7 +1,13 @@
 """Rule evaluation and persistence.
 
 Semantics:
-1. Protection rules run first — a hit forces KEEP and excludes the message
+0. Synthetic records (a candidate vote carrying skip_llm — Google Voice
+   SMS/call/voicemail) are decided before everything else. They are converter
+   artifacts addressed `<number>@unknown.email`, not real correspondence, and
+   the outbound-SMS copy can leak that number into the derived contacts — so
+   the known-contact protection would otherwise force KEEP and shield them from
+   cleanup. skip_llm is the only signal used here; no rule is matched by name.
+1. Protection rules run next — a hit forces KEEP and excludes the message
    from LLM classification and the policy gates. Exception: Gmail's own Spam
    label overrides the keyword protections (scam bait imitates exactly those
    subjects) but never known_contact; overridden hits are still recorded, so
@@ -69,6 +75,24 @@ class RuleResult:
 
 
 def evaluate_message(msg: MessageView, ctx: RuleContext) -> RuleResult:
+    candidate_hits = tuple(v for rule in CANDIDATE_RULES if (v := rule(msg, ctx)))
+
+    # Synthetic records (skip_llm — Google Voice) are decided before protection:
+    # they are converter artifacts, not correspondence, and a leaked phone number
+    # in the contacts must not let known_contact shield them from cleanup. They
+    # are tagged CLASSIFIED_BY_VOICE so the classifier skips them and the auto-
+    # trash gate never fires (skip_llm => ai_confidence stays NULL => review).
+    synthetic_hits = tuple(v for v in candidate_hits if v.skip_llm)
+    if synthetic_hits:
+        winner = _select_candidate(synthetic_hits)
+        return RuleResult(
+            winner.staged_label,
+            winner.category,
+            candidate_hits,
+            ephemeral=winner.ephemeral,
+            classified_by=CLASSIFIED_BY_VOICE,
+        )
+
     absolute_hits = tuple(
         v for rule in ABSOLUTE_PROTECTION_RULES if (v := rule(msg, ctx))
     )
@@ -82,13 +106,11 @@ def evaluate_message(msg: MessageView, ctx: RuleContext) -> RuleResult:
 
     # Spam override: keyword protection hits are still recorded below, so the
     # policy gates can never auto-approve these — they always reach a human.
-    candidate_hits = tuple(v for rule in CANDIDATE_RULES if (v := rule(msg, ctx)))
-
-    # The winning vote's own fields drive the disposition — no rule is matched
-    # by name. A skip_llm vote (voice) is tagged so the classifier skips it (and
-    # the auto-trash gate never fires on it); an ephemeral vote (digest) lets the
-    # gate waive the age floor once the LLM also confirms; priority lets either
-    # beat the ordinary ARCHIVE > DELETE > UNSUBSCRIBE precedence.
+    #
+    # The winning vote's own fields drive the disposition — no rule is matched by
+    # name. An ephemeral vote (digest) lets the gate waive the age floor once the
+    # LLM also confirms; priority lets a vote beat the ordinary ARCHIVE > DELETE >
+    # UNSUBSCRIBE precedence. (skip_llm votes were already handled above.)
     if candidate_hits:
         winner = _select_candidate(candidate_hits)
         return RuleResult(
@@ -96,7 +118,6 @@ def evaluate_message(msg: MessageView, ctx: RuleContext) -> RuleResult:
             winner.category,
             keyword_hits + candidate_hits,
             ephemeral=winner.ephemeral,
-            classified_by=CLASSIFIED_BY_VOICE if winner.skip_llm else None,
         )
 
     return RuleResult(StagedLabel.NEEDS_REVIEW, None, keyword_hits + candidate_hits)

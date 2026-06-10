@@ -8,6 +8,7 @@ from collections import Counter
 from email.utils import parseaddr
 
 from .headers import addr_domain, normalize_addr
+from .voice import UNKNOWN_DOMAIN
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +43,16 @@ def derive_contacts(conn: sqlite3.Connection, user_addresses: tuple[str, ...]) -
     for (to_all,) in rows:
         for addr in to_all.split(","):
             addr = addr.strip()
-            if addr and addr not in own:
-                counts[addr] += 1
+            if not addr or addr in own:
+                continue
+            # `<number>@unknown.email` is the Google Voice converter's synthetic
+            # placeholder for the other party in an outbound SMS — not a real
+            # address you correspond with. Deriving it as a contact would let
+            # known_contact protect the matching inbound Voice records from the
+            # voice cleanup rule (and inflate the contact list with phone numbers).
+            if addr_domain(addr) == UNKNOWN_DOMAIN:
+                continue
+            counts[addr] += 1
 
     conn.executemany(
         """

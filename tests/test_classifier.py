@@ -10,7 +10,7 @@ import threading
 import pytest
 from langchain_core.runnables import RunnableLambda
 
-from conftest import insert_message
+from conftest import add_rule_hit, insert_message
 
 from local_llm_email_cleaner.config import DEFAULTS
 from local_llm_email_cleaner.llm import classifier
@@ -79,12 +79,92 @@ def test_delete_candidate_llm_disagreement_demotes_to_review(conn, cfg):
     assert row["classified_by"] == "rules+llm"
 
 
-def test_keep_rows_not_selected(conn, cfg):
+def test_keep_without_protection_hit_not_selected(conn, cfg):
+    # A KEEP with no protection rule_hit (a degenerate state) is not double-
+    # checked — only keyword-protected KEEPs are.
     insert_message(
         conn, staged_label="KEEP", proposed_action="keep", classified_by="rules"
     )
     stats = classifier.classify_messages(conn, cfg, fake_chain())
     assert stats.processed == 0
+
+
+def keyword_keep(conn, **overrides) -> int:
+    """A KEEP staged by a keyword protection rule (financial/security)."""
+    msg_id = insert_message(
+        conn,
+        staged_label="KEEP",
+        proposed_action="keep",
+        ai_category="financial_legal_medical",
+        classified_by="rules",
+        **overrides,
+    )
+    add_rule_hit(conn, msg_id, "protection", "financial_legal_medical")
+    return msg_id
+
+
+def test_keyword_protected_keep_is_double_checked_and_downgraded(conn, cfg):
+    # The keyword rule over-matched a promo footer; the LLM calls it junk and
+    # pulls it down to a delete candidate for human review.
+    msg_id = keyword_keep(conn)
+    stats = classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
+    assert stats.processed == 1
+    row = row_of(conn, msg_id)
+    assert row["staged_label"] == "DELETE_CANDIDATE"
+    assert row["proposed_action"] == "trash"
+    assert row["classified_by"] == "rules+llm"
+    assert row["ai_confidence"] == 0.97
+
+
+def test_keyword_protected_keep_downgraded_to_archive(conn, cfg):
+    msg_id = keyword_keep(conn)
+    classifier.classify_messages(conn, cfg, fake_chain(action="archive"))
+    row = row_of(conn, msg_id)
+    assert row["staged_label"] == "ARCHIVE_CANDIDATE"
+    assert row["proposed_action"] == "archive"
+
+
+def test_keyword_protected_keep_confirmed_stays_kept(conn, cfg):
+    # The LLM agrees it's genuinely sensitive: it stays KEEP, now with a verdict.
+    msg_id = keyword_keep(conn)
+    classifier.classify_messages(
+        conn, cfg, fake_chain(action="keep", category="financial_legal_medical")
+    )
+    row = row_of(conn, msg_id)
+    assert row["staged_label"] == "KEEP"
+    assert row["proposed_action"] == "keep"
+    assert row["classified_by"] == "rules+llm"
+
+
+def test_keyword_protected_keep_review_verdict_demotes(conn, cfg):
+    # KEEP accepts every verdict (like a primary NEEDS_REVIEW row); a 'review'
+    # verdict simply routes it to a human.
+    msg_id = keyword_keep(conn)
+    classifier.classify_messages(conn, cfg, fake_chain(action="review"))
+    row = row_of(conn, msg_id)
+    assert row["staged_label"] == "NEEDS_REVIEW"
+    assert row["proposed_action"] == "review"
+    assert row["classified_by"] == "rules+llm"
+
+
+def test_known_contact_keep_not_double_checked(conn, cfg):
+    # The one absolute protection: a known-contact KEEP is never reviewed down.
+    msg_id = insert_message(
+        conn, staged_label="KEEP", proposed_action="keep", classified_by="rules"
+    )
+    add_rule_hit(conn, msg_id, "protection", "known_contact")
+    stats = classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
+    assert stats.processed == 0
+    assert row_of(conn, msg_id)["staged_label"] == "KEEP"
+
+
+def test_keep_with_both_known_contact_and_keyword_not_selected(conn, cfg):
+    # Known-contact protection is absolute even when a keyword rule also fired.
+    msg_id = keyword_keep(conn)
+    add_rule_hit(conn, msg_id, "protection", "known_contact")
+    stats = classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
+    assert stats.processed == 0
+    assert row_of(conn, msg_id)["staged_label"] == "KEEP"
 
 
 def test_voice_delete_candidates_not_selected(conn, cfg):
