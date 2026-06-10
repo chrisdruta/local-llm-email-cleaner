@@ -33,7 +33,7 @@ def render() -> None:
             "overrides config.toml."
         )
 
-        c = st.columns(5)
+        c = st.columns(6)
         trash_conf = c[0].slider(
             "Auto-trash min LLM confidence",
             0.5,
@@ -60,7 +60,17 @@ def render() -> None:
             0.01,
             help="Set above 1.0 to disable auto-archive entirely.",
         )
-        rule_only = c[4].checkbox(
+        llm_only_conf = c[4].slider(
+            "LLM-only min confidence",
+            0.5,
+            1.05,
+            saved.auto_llm_only_min_confidence,
+            0.01,
+            help="Messages NO rule matched may auto-approve on the LLM's word "
+            "alone above this (higher) bar — age floor, attachments, contact "
+            "and keep-hit guards still apply. Set above 1.0 to disable.",
+        )
+        rule_only = c[5].checkbox(
             "Allow rule-only auto-trash",
             saved.auto_trash_allow_rule_only,
             help="Let trash rules with confirm_with_llm=false auto-approve "
@@ -74,6 +84,7 @@ def render() -> None:
             auto_trash_min_age_months=int(age_months),
             auto_trash_ephemeral_min_age_days=int(eph_days),
             auto_archive_min_confidence=archive_conf,
+            auto_llm_only_min_confidence=llm_only_conf,
             auto_trash_allow_rule_only=rule_only,
         )
 

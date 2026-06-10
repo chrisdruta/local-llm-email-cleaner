@@ -56,6 +56,11 @@ auto_archive_min_confidence = 0.80
 # confidence. Off by default — rule-only trash (including Google Voice records)
 # then always needs explicit human approval in review.
 auto_trash_allow_rule_only = false
+# Messages NO rule matched normally always wait for human review; when the
+# LLM's confidence clears this (deliberately higher) bar, its verdict may
+# auto-approve anyway. Every other guard (age floor, attachments, known
+# contacts, keep hits) still applies. Set > 1 to disable the llm-only path.
+auto_llm_only_min_confidence = 0.95
 
 [gmail]
 oauth_port = 8765
@@ -95,6 +100,7 @@ class Config:
     auto_trash_ephemeral_min_age_days: int
     auto_archive_min_confidence: float
     auto_trash_allow_rule_only: bool
+    auto_llm_only_min_confidence: float
     # gmail
     oauth_port: int
     requests_per_second: float
@@ -122,6 +128,7 @@ DEFAULTS = Config(
     auto_trash_ephemeral_min_age_days=7,
     auto_archive_min_confidence=0.80,
     auto_trash_allow_rule_only=False,
+    auto_llm_only_min_confidence=0.95,
     oauth_port=8765,
     requests_per_second=5.0,
     uncertain_confidence_threshold=0.75,
@@ -171,6 +178,9 @@ def _from_toml(cfg: Config, data: dict) -> Config:
         ),
         auto_trash_allow_rule_only=bool(
             policy.get("auto_trash_allow_rule_only", cfg.auto_trash_allow_rule_only)
+        ),
+        auto_llm_only_min_confidence=float(
+            policy.get("auto_llm_only_min_confidence", cfg.auto_llm_only_min_confidence)
         ),
         oauth_port=int(gmail.get("oauth_port", cfg.oauth_port)),
         requests_per_second=float(

@@ -218,13 +218,16 @@ mail stays easy to find — and bulk-undo — in Gmail.
 3. **Policy gates** auto-approve (tunable in `[policy]` config or live on the
    UI's Policy page, which previews exactly what would be approved):
    - **trash** only when *all* hold: staged by a trash rule AND confirmed by
-     the LLM at confidence ≥ 0.90, no attachments, not a known contact, no
-     keep-voting rule hit, older than 12 months (digests flagged ephemeral by
-     both the rule and the LLM only need 7 days);
+     the LLM at confidence ≥ 0.90 — or, for messages **no rule matched**, the
+     LLM alone at the higher `auto_llm_only_min_confidence` bar (default
+     0.95; set above 1 to disable) — plus no attachments, not a known
+     contact, no keep-voting rule hit, older than 12 months (digests flagged
+     ephemeral by both the rule and the LLM only need 7 days);
    - **archive** (laxer — it's reversible and labeled in Gmail) when: staged
      by an archive rule, not a known contact, no keep-voting hit, and — if
      the LLM saw it — confidence ≥ 0.80 (`auto_archive_min_confidence`; set
-     it above 1 to disable auto-archive).
+     it above 1 to disable auto-archive). No-rule-matched archives use the
+     same higher LLM-only bar as trash.
 
    Everything else waits for you in the review UI. The Review page's presets
    surface exactly what needs human eyes: rule/LLM disagreements (prime

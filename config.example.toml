@@ -44,6 +44,11 @@ auto_archive_min_confidence = 0.80
 # confidence. Off by default — rule-only trash (including Google Voice records)
 # then always needs explicit human approval in review.
 auto_trash_allow_rule_only = false
+# Messages NO rule matched normally always wait for human review; when the
+# LLM's confidence clears this (deliberately higher) bar, its verdict may
+# auto-approve anyway. Every other guard (age floor, attachments, known
+# contacts, keep hits) still applies. Set > 1 to disable the llm-only path.
+auto_llm_only_min_confidence = 0.95
 
 [gmail]
 oauth_port = 8765

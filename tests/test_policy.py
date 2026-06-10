@@ -84,18 +84,63 @@ def test_gate_rejects_known_contacts(conn, cfg):
     assert status_of(conn, msg_id) == "pending"
 
 
-def test_gate_requires_rule_staged_trash(conn, cfg):
-    # LLM said trash, but no deterministic rule ever matched.
-    msg_id = insert_message(
+def llm_only_row(conn, action="trash", confidence=0.99, **overrides) -> int:
+    """No rule matched; the LLM decided alone."""
+    return insert_message(
         conn,
         ruled_at=RULED,
-        llm_action="trash",
-        llm_confidence=0.99,
-        action="trash",
+        llm_action=action,
+        llm_confidence=confidence,
+        action=action,
         decision_source="llm",
+        **overrides,
     )
+
+
+def test_llm_only_trash_auto_approves_above_the_higher_bar(conn, cfg):
+    msg_id = llm_only_row(conn, confidence=0.96)
+    policy.apply_policy(conn, params(cfg))  # default bar 0.95
+    assert status_of(conn, msg_id) == "auto_approved"
+
+
+def test_llm_only_trash_below_the_bar_stays_pending(conn, cfg):
+    # 0.92 clears the rule+llm threshold (0.90) but not the llm-only bar.
+    msg_id = llm_only_row(conn, confidence=0.92)
     policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
+
+
+def test_llm_only_path_can_be_disabled(conn, cfg):
+    msg_id = llm_only_row(conn, confidence=0.99)
+    policy.apply_policy(conn, params(cfg, auto_llm_only_min_confidence=1.01))
+    assert status_of(conn, msg_id) == "pending"
+
+
+def test_llm_only_trash_still_needs_the_structural_guards(conn, cfg):
+    recent = llm_only_row(
+        conn,
+        confidence=0.99,
+        date_utc=RECENT_DATE.isoformat(),
+        date_epoch=int(RECENT_DATE.timestamp()),
+    )
+    attached = llm_only_row(
+        conn, confidence=0.99, has_attachments=1, rfc_message_id="att@x"
+    )
+    kept = llm_only_row(conn, confidence=0.99, rfc_message_id="keep@x")
+    add_rule_hit(conn, kept, "keep", "financial_legal_medical")
+    policy.apply_policy(conn, params(cfg))
+    assert status_of(conn, recent) == "pending"  # age floor (no ephemeral waiver)
+    assert status_of(conn, attached) == "pending"
+    assert status_of(conn, kept) == "pending"
+
+
+def test_llm_only_archive_auto_approves(conn, cfg):
+    high = llm_only_row(conn, action="archive", confidence=0.97)
+    low = llm_only_row(conn, action="archive", confidence=0.9, rfc_message_id="low@x")
+    result = policy.apply_policy(conn, params(cfg))
+    assert result["auto_archived"] == 1
+    assert status_of(conn, high) == "auto_approved"
+    assert status_of(conn, low) == "pending"
 
 
 def test_gate_rejects_protect_won_rows(conn, cfg):
@@ -255,13 +300,14 @@ def test_archive_gate_respects_llm_confidence_when_present(conn, cfg):
     assert status_of(conn, high) == "auto_approved"
 
 
-def test_archive_gate_requires_rule_staged_archive(conn, cfg):
-    # Pure-LLM archive suggestion: no rule_action -> review only.
+def test_archive_gate_requires_rule_or_the_llm_only_bar(conn, cfg):
+    # Pure-LLM archive below the llm-only bar: no rule_action -> review only,
+    # even though 0.9 clears the ordinary archive threshold (0.80).
     msg_id = insert_message(
         conn,
         ruled_at=RULED,
         llm_action="archive",
-        llm_confidence=0.99,
+        llm_confidence=0.9,
         action="archive",
         decision_source="llm",
     )

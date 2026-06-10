@@ -4,7 +4,9 @@ Auto-trash (every condition must hold):
     action == trash, staged by a deterministic rule (rule_action == trash)
     AND LLM confidence >= auto_trash_min_confidence
         (or, when auto_trash_allow_rule_only is enabled, the rule decided
-         alone — the one way rule-only trash can auto-approve)
+         alone — the one way rule-only trash can auto-approve;
+         or no rule matched but the LLM cleared the higher
+         auto_llm_only_min_confidence bar)
     AND no attachments
     AND not from a known contact
     AND no keep-voting rule hit and not protect-won
@@ -53,6 +55,10 @@ class PolicyParams:
     #: confidence. Off by default: voice rows and other rule-only trash then
     #: always require explicit human approval.
     auto_trash_allow_rule_only: bool = False
+    #: let a no-rule-matched message auto-approve on the LLM's word alone when
+    #: its confidence clears this (deliberately higher) bar. All structural
+    #: guards still apply. Set > 1 to disable the llm-only path.
+    auto_llm_only_min_confidence: float = 0.95
 
     @classmethod
     def from_config(cls, cfg: Config) -> PolicyParams:
@@ -62,6 +68,7 @@ class PolicyParams:
             auto_trash_ephemeral_min_age_days=cfg.auto_trash_ephemeral_min_age_days,
             auto_archive_min_confidence=cfg.auto_archive_min_confidence,
             auto_trash_allow_rule_only=cfg.auto_trash_allow_rule_only,
+            auto_llm_only_min_confidence=cfg.auto_llm_only_min_confidence,
         )
 
     @classmethod
@@ -114,17 +121,25 @@ def _trash_gate_where() -> str:
     return f"""
   review_status='pending'
   AND action='{Action.TRASH.value}'
-  -- staged by a deterministic rule; a pure-LLM trash never auto-approves
-  AND rule_action='{Action.TRASH.value}'
   AND (
-        (llm_confidence IS NOT NULL AND llm_confidence >= :min_confidence
-         AND decision_source='{DecisionSource.RULE_LLM.value}')
-        OR (:allow_rule_only AND decision_source='{DecisionSource.RULE.value}')
+        -- staged by a deterministic trash rule AND confirmed by the LLM
+        (rule_action='{Action.TRASH.value}'
+         AND decision_source='{DecisionSource.RULE_LLM.value}'
+         AND llm_confidence IS NOT NULL AND llm_confidence >= :min_confidence)
+        -- a trash rule that decided alone (opt-in)
+        OR (rule_action='{Action.TRASH.value}'
+            AND :allow_rule_only AND decision_source='{DecisionSource.RULE.value}')
+        -- no rule matched, but the LLM is exceptionally confident (the higher
+        -- llm-only bar; > 1 disables this path)
+        OR (decision_source='{DecisionSource.LLM.value}'
+            AND llm_confidence IS NOT NULL
+            AND llm_confidence >= :llm_only_min_confidence)
       )
   AND has_attachments = 0
   -- Age floor, waived only when BOTH the rule and the LLM flagged the message
   -- ephemeral (digests — worthless once their day passes); the short grace
   -- still applies. Everything else needs the full auto_trash_min_age_months.
+  -- (LLM-only rows always need the full floor: rule_ephemeral is 0 for them.)
   AND date_epoch IS NOT NULL AND (
         date_epoch < :age_cutoff
         OR (rule_ephemeral = 1 AND llm_ephemeral = 1
@@ -139,10 +154,17 @@ def _archive_gate_where() -> str:
     return f"""
   review_status='pending'
   AND action='{Action.ARCHIVE.value}'
-  AND rule_action='{Action.ARCHIVE.value}'
-  -- A NULL confidence (rule decided alone) counts as full confidence, so a
-  -- threshold > 1 disables the gate entirely.
-  AND COALESCE(llm_confidence, 1.0) >= :min_confidence
+  AND (
+        -- staged by a deterministic archive rule. A NULL confidence (rule
+        -- decided alone) counts as full confidence, so a threshold > 1
+        -- disables this path entirely.
+        (rule_action='{Action.ARCHIVE.value}'
+         AND COALESCE(llm_confidence, 1.0) >= :min_confidence)
+        -- no rule matched, but the LLM is exceptionally confident
+        OR (decision_source='{DecisionSource.LLM.value}'
+            AND llm_confidence IS NOT NULL
+            AND llm_confidence >= :llm_only_min_confidence)
+      )
   AND {_NOT_KNOWN_CONTACT}
   AND {_NO_KEEP_HIT}
 """
@@ -152,10 +174,18 @@ def _trash_params(params: PolicyParams) -> dict:
     return {
         "min_confidence": params.auto_trash_min_confidence,
         "allow_rule_only": int(params.auto_trash_allow_rule_only),
+        "llm_only_min_confidence": params.auto_llm_only_min_confidence,
         "age_cutoff": parse_epoch_to_age_cutoff(params.auto_trash_min_age_months),
         "ephemeral_age_cutoff": parse_epoch_to_age_cutoff_days(
             params.auto_trash_ephemeral_min_age_days
         ),
+    }
+
+
+def _archive_params(params: PolicyParams) -> dict:
+    return {
+        "min_confidence": params.auto_archive_min_confidence,
+        "llm_only_min_confidence": params.auto_llm_only_min_confidence,
     }
 
 
@@ -203,7 +233,7 @@ def preview_policy(
 
     trash_count, trash_sample = gather(_trash_gate_where(), _trash_params(params))
     archive_count, archive_sample = gather(
-        _archive_gate_where(), {"min_confidence": params.auto_archive_min_confidence}
+        _archive_gate_where(), _archive_params(params)
     )
     return GatePreview(trash_count, archive_count, trash_sample, archive_sample)
 
@@ -226,7 +256,7 @@ def apply_policy(conn: sqlite3.Connection, params: PolicyParams) -> dict[str, in
     cursor = conn.execute(
         f"UPDATE messages SET review_status='auto_approved', "
         f"review_note='auto-archive policy gate' WHERE {_archive_gate_where()}",
-        {"min_confidence": params.auto_archive_min_confidence},
+        _archive_params(params),
     )
     auto_archived = cursor.rowcount
     conn.commit()
