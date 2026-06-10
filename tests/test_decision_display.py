@@ -38,7 +38,7 @@ def test_rule_decided_alone(conn):
         ruled_at=RULED,
         rule_name="voice",
         rule_action="trash",
-        action="trash",
+        staged_action="trash",
         decision_source="rule",
     )
     text = summary_for(conn, mid)
@@ -57,7 +57,7 @@ def test_llm_confirmation_with_losing_hits(conn):
         llm_action="trash",
         llm_confidence=0.93,
         llm_reason="stale roundup",
-        action="trash",
+        staged_action="trash",
         decision_source="rule+llm",
     )
     conn.execute(
@@ -72,7 +72,7 @@ def test_llm_confirmation_with_losing_hits(conn):
     assert "**confirmed**" in text and "0.93" in text and "stale roundup" in text
 
 
-def test_disagreement_routes_to_review(conn):
+def test_disagreement_awaits_human_decision(conn):
     mid = insert_message(
         conn,
         ruled_at=RULED,
@@ -81,10 +81,8 @@ def test_disagreement_routes_to_review(conn):
         llm_action="keep",
         llm_confidence=0.7,
         llm_reason="looks personal",
-        action="review",
-        decision_source="rule+llm",
     )
     text = summary_for(conn, mid)
     assert "**disagreed**" in text
     assert "trash vs keep" in text
-    assert "Final:** review" in text
+    assert "(undecided)" in text

@@ -301,7 +301,7 @@ def insert_message(conn: sqlite3.Connection, **overrides) -> int:
         "llm_confidence": None,
         "llm_reason": None,
         "llm_ephemeral": 0,
-        "action": None,
+        "staged_action": None,
         "decision_source": None,
         "review_status": "pending",
     }

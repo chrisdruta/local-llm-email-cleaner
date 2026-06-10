@@ -48,9 +48,12 @@ CREATE TABLE IF NOT EXISTS messages (
     llm_confidence    REAL,
     llm_reason        TEXT,
     llm_ephemeral     INTEGER NOT NULL DEFAULT 0,
-    -- final decision (rules engine or classifier, whichever finalizes)
-    action            TEXT,                            -- keep | archive | trash | review; NULL = awaiting LLM
-    decision_source   TEXT,                            -- 'rule' | 'llm' | 'rule+llm'
+    -- final decision (engine, classifier, or a human in the review UI).
+    -- staged_action and decision_source are NULL together (undecided: awaiting
+    -- the LLM, or awaiting a human decision when llm_action is set) or set
+    -- together. staged_action never stores 'review'.
+    staged_action     TEXT,                            -- keep | archive | trash
+    decision_source   TEXT,                            -- 'rule' | 'llm' | 'rule+llm' | 'human'
     -- review lifecycle (writers: policy.py, review UI, gmail/runner.py)
     review_status     TEXT NOT NULL DEFAULT 'pending', -- pending|approved|auto_approved|rejected|applied|skipped
     review_note       TEXT,
@@ -63,7 +66,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_from_domain ON messages(from_domain);
 CREATE INDEX IF NOT EXISTS idx_messages_from_addr   ON messages(from_addr);
 CREATE INDEX IF NOT EXISTS idx_messages_date_epoch  ON messages(date_epoch);
-CREATE INDEX IF NOT EXISTS idx_messages_action      ON messages(action);
+CREATE INDEX IF NOT EXISTS idx_messages_staged_action ON messages(staged_action);
 CREATE INDEX IF NOT EXISTS idx_messages_review      ON messages(review_status);
 CREATE INDEX IF NOT EXISTS idx_messages_rule        ON messages(rule_name);
 

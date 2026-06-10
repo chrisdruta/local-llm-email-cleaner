@@ -24,21 +24,21 @@ def test_export_writes_only_approved_actionable(conn, tmp_path):
     insert_message(
         conn,
         rfc_message_id="a@example.com",
-        action="trash",
+        staged_action="trash",
         rule_action="trash",
         review_status="approved",
     )
     insert_message(
         conn,
         rfc_message_id="p@example.com",
-        action="trash",
+        staged_action="trash",
         rule_action="trash",
         review_status="pending",
     )
     insert_message(
         conn,
         rfc_message_id="k@example.com",
-        action="keep",
+        staged_action="keep",
         review_status="approved",
     )
 
@@ -53,7 +53,7 @@ def test_export_neutralizes_formula_injection(conn, tmp_path):
     insert_message(
         conn,
         rfc_message_id="evil@example.com",
-        action="trash",
+        staged_action="trash",
         rule_action="trash",
         review_status="approved",
         subject='=HYPERLINK("http://evil.example","click")',

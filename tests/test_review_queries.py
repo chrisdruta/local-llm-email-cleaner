@@ -66,18 +66,21 @@ def test_disagreement_filter_and_query(conn):
         ruled_at=RULED,
         rule_action="trash",
         llm_action="trash",
-        action="trash",
+        staged_action="trash",
     )
     disagree = insert_message(
         conn,
         ruled_at=RULED,
         rule_action="trash",
         llm_action="keep",
-        action="review",
         rfc_message_id="d@x",
     )
     llm_only = insert_message(  # noqa: F841 — no rule verdict, not a disagreement
-        conn, ruled_at=RULED, llm_action="keep", action="keep", rfc_message_id="l@x"
+        conn,
+        ruled_at=RULED,
+        llm_action="keep",
+        staged_action="keep",
+        rfc_message_id="l@x",
     )
 
     sql, params = queries.build_message_query({"disagreement": True})

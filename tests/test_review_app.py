@@ -33,7 +33,7 @@ def ui_env(tmp_path, monkeypatch, cfg, conn, request):
         llm_action="trash",
         llm_confidence=0.95,
         llm_reason="promo",
-        action="trash",
+        staged_action="trash",
         decision_source="rule+llm",
         rfc_message_id="trash@x",
     )
@@ -45,8 +45,6 @@ def ui_env(tmp_path, monkeypatch, cfg, conn, request):
         llm_action="trash",
         llm_confidence=0.7,
         llm_reason="dispute",
-        action="review",
-        decision_source="rule+llm",
         review_status="pending",
         rfc_message_id="disagree@x",
     )

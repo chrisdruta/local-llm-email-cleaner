@@ -1,18 +1,26 @@
 """Core enums and dataclasses shared across pipeline stages.
 
-The v3 decision lifecycle, one writer per column:
+The decision lifecycle, one writer per column:
 
   ingest   -> identity/content columns; review_status defaults to 'pending'
   rules    -> ruled_at + rule_* (and, when the winning rule decides alone,
-              action + decision_source='rule'); every match goes to rule_hits
-  classify -> llm_* + action + decision_source ('llm' when no rule matched,
-              'rule+llm' when confirming a rule; disagreement -> 'review')
+              staged_action + decision_source='rule'); every match -> rule_hits
+  classify -> llm_*; then staged_action + decision_source via finalize() —
+              a rule-vs-LLM disagreement leaves BOTH NULL (a human must pick)
+  human    -> staged_action + decision_source='human' (the UI's decide buttons;
+              free choice, may override any earlier verdict until applied)
   policy   -> review_status pending <-> auto_approved (the only auto-approval)
   review   -> review_status approved / rejected (human)
   runner   -> review_status applied / skipped (after Gmail reconcile+mutate)
 
-"Awaiting LLM classification" is simply `action IS NULL AND ruled_at IS NOT
-NULL` — no shared predicate machinery.
+Invariant: staged_action and decision_source are NULL together or set
+together. The undecided states partition on existing columns:
+
+  ruled_at NULL                                   -> not yet ruled
+  staged_action NULL + llm_action NULL  (ruled)   -> awaiting the LLM
+  staged_action NULL + llm_action set             -> awaiting a human decision
+
+— see AWAITING_LLM_WHERE / NEEDS_DECISION_WHERE below.
 """
 
 from __future__ import annotations
@@ -22,11 +30,11 @@ from enum import StrEnum
 
 
 class Action(StrEnum):
-    """The single action vocabulary, shared by rules, the LLM, and the runner.
+    """The action vocabulary, shared by rules, the LLM, and the runner.
 
-    REVIEW means "a human must decide" — rules never stage it (a rule that
-    can't decide shouldn't match), but the LLM may return it and a
-    rule-vs-LLM disagreement resolves to it.
+    Asymmetry to preserve: REVIEW is the LLM's own "I'm unsure" verdict and
+    exists ONLY in llm_action — messages.staged_action never stores it
+    (an undecided message is staged_action NULL, not 'review').
     """
 
     KEEP = "keep"
@@ -36,11 +44,12 @@ class Action(StrEnum):
 
 
 class DecisionSource(StrEnum):
-    """Who produced messages.action."""
+    """Who produced messages.staged_action."""
 
     RULE = "rule"  # a rule decided alone (protect, or confirm_with_llm=false)
     LLM = "llm"  # no rule matched; the LLM's suggestion stands
-    RULE_LLM = "rule+llm"  # rule staged it, LLM weighed in (confirm or dispute)
+    RULE_LLM = "rule+llm"  # rule staged it, the LLM independently agreed
+    HUMAN = "human"  # decided (or overridden) in the review UI
 
 
 class ReviewStatus(StrEnum):
@@ -80,21 +89,37 @@ APPROVABLE_STATUSES: tuple[str, ...] = (
 )
 
 
-def finalize(rule_action: str | None, llm_action: str) -> tuple[str, str]:
-    """Resolve a message's final (action, decision_source) once the LLM has
-    spoken. The one place rule-vs-LLM agreement is decided:
+#: ruled, no decision yet, and the LLM hasn't spoken — the classify population.
+#: The llm_action IS NULL term is load-bearing: without it, every row awaiting
+#: a HUMAN decision would be re-sent to the LLM (and re-billed) on every run.
+AWAITING_LLM_WHERE = (
+    "staged_action IS NULL AND ruled_at IS NOT NULL AND llm_action IS NULL"
+)
 
-    - no rule matched          -> the LLM's suggestion stands
-    - LLM agrees with the rule -> confirmed
-    - disagreement             -> a human decides (strict equality; the LLM is
+#: the LLM has spoken but nothing got decided — rule-vs-LLM disagreements,
+#: LLM 'review' verdicts, and failed classifications. A human picks the action.
+NEEDS_DECISION_WHERE = "staged_action IS NULL AND llm_action IS NOT NULL"
+
+
+def finalize(rule_action: str | None, llm_action: str) -> tuple[str | None, str | None]:
+    """Resolve (staged_action, decision_source) once the LLM has spoken. The
+    one place rule-vs-LLM agreement is decided:
+
+    - no rule matched          -> the LLM's suggestion stands ('review' = the
+                                  LLM itself is unsure -> stays undecided)
+    - LLM agrees with the rule -> confirmed (strict equality; the LLM is
                                   deliberately blind to the rule's verdict, so
                                   agreement is meaningful)
+    - disagreement             -> (None, None): undecided, a human picks via
+                                  the review UI's decide buttons
     """
     if rule_action is None:
+        if llm_action == Action.REVIEW.value:
+            return None, None
         return llm_action, DecisionSource.LLM.value
     if rule_action == llm_action:
         return rule_action, DecisionSource.RULE_LLM.value
-    return Action.REVIEW.value, DecisionSource.RULE_LLM.value
+    return None, None
 
 
 def sql_in_list(values: tuple[str, ...]) -> str:

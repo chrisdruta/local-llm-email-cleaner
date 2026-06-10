@@ -73,7 +73,7 @@ def test_finalized_rows_not_selected(conn, cfg):
         ruled_at=RULED,
         rule_name="voice",
         rule_action="trash",
-        action="trash",
+        staged_action="trash",
         decision_source="rule",
     )
     assert classifier.classify_messages(conn, cfg, fake_chain()).processed == 0
@@ -86,7 +86,7 @@ def test_selection_is_action_null_and_ruled(conn, cfg):
     def awaiting() -> int:
         return conn.execute(
             "SELECT COUNT(*) FROM messages "
-            "WHERE action IS NULL AND ruled_at IS NOT NULL"
+            "WHERE staged_action IS NULL AND ruled_at IS NOT NULL AND llm_action IS NULL"
         ).fetchone()[0]
 
     assert awaiting() == 2
@@ -107,7 +107,7 @@ def test_no_rule_match_takes_llm_action(conn, cfg):
     assert row["llm_category"] == "promotion"
     assert row["llm_confidence"] == 0.97
     assert row["llm_reason"] == "old promo"
-    assert row["action"] == "trash"
+    assert row["staged_action"] == "trash"
     assert row["decision_source"] == "llm"
 
 
@@ -115,26 +115,26 @@ def test_rule_confirmed_by_llm(conn, cfg):
     msg_id = rule_staged_row(conn, rule_action="trash")
     classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
     row = row_of(conn, msg_id)
-    assert row["action"] == "trash"
+    assert row["staged_action"] == "trash"
     assert row["decision_source"] == "rule+llm"
 
 
-def test_rule_disagreement_routes_to_review(conn, cfg):
+def test_rule_disagreement_stays_undecided(conn, cfg):
     msg_id = rule_staged_row(conn, rule_action="trash")
     classifier.classify_messages(conn, cfg, fake_chain(action="keep", confidence=0.8))
     row = row_of(conn, msg_id)
     assert row["llm_action"] == "keep"  # the verdict is recorded verbatim
-    assert row["action"] == "review"  # but a human decides
-    assert row["decision_source"] == "rule+llm"
+    assert row["staged_action"] is None  # but a human decides
+    assert row["decision_source"] is None
 
 
 def test_archive_rule_llm_trash_is_disagreement(conn, cfg):
-    # v3 is strict: no archive->trash escalation; any mismatch goes to review.
+    # Strict: no archive->trash escalation; any mismatch awaits a human.
     msg_id = rule_staged_row(conn, rule_action="archive")
     classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
     row = row_of(conn, msg_id)
-    assert row["action"] == "review"
-    assert row["decision_source"] == "rule+llm"
+    assert row["staged_action"] is None
+    assert row["decision_source"] is None
 
 
 def test_keep_rule_confirmed_stays_kept(conn, cfg):
@@ -144,26 +144,28 @@ def test_keep_rule_confirmed_stays_kept(conn, cfg):
         conn, cfg, fake_chain(action="keep", category="financial_legal_medical")
     )
     row = row_of(conn, msg_id)
-    assert row["action"] == "keep"
+    assert row["staged_action"] == "keep"
     assert row["decision_source"] == "rule+llm"
 
 
-def test_keep_rule_llm_trash_routes_to_review(conn, cfg):
+def test_keep_rule_llm_trash_stays_undecided(conn, cfg):
     # The keyword rule over-matched a promo footer; the LLM calls it junk.
-    # v3 routes the dispute to a human instead of directly downgrading.
+    # The dispute awaits the human's decide buttons, no direct downgrade.
     msg_id = rule_staged_row(conn, rule_action="keep")
     classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
     row = row_of(conn, msg_id)
     assert row["llm_action"] == "trash"
-    assert row["action"] == "review"
+    assert row["staged_action"] is None
 
 
-def test_llm_review_verdict_stands_for_no_rule_rows(conn, cfg):
+def test_llm_review_verdict_stays_undecided(conn, cfg):
+    # The LLM's own "unsure" never becomes a staged action.
     msg_id = no_rule_row(conn)
     classifier.classify_messages(conn, cfg, fake_chain(action="review", confidence=0.4))
     row = row_of(conn, msg_id)
-    assert row["action"] == "review"
-    assert row["decision_source"] == "llm"
+    assert row["llm_action"] == "review"
+    assert row["staged_action"] is None
+    assert row["decision_source"] is None
 
 
 def test_llm_ephemeral_recorded_verbatim(conn, cfg):
@@ -176,6 +178,17 @@ def test_llm_ephemeral_recorded_verbatim(conn, cfg):
     row = row_of(conn, msg_id)
     assert row["llm_ephemeral"] == 1
     assert row["rule_ephemeral"] == 0  # untouched — owned by the rules stage
+
+
+def test_finalize_truth_table():
+    from local_llm_email_cleaner.models import finalize
+
+    assert finalize(None, "trash") == ("trash", "llm")
+    assert finalize(None, "review") == (None, None)  # LLM unsure -> undecided
+    assert finalize("trash", "trash") == ("trash", "rule+llm")
+    assert finalize("keep", "trash") == (None, None)  # disagreement
+    assert finalize("archive", "trash") == (None, None)  # no escalation
+    assert finalize("trash", "review") == (None, None)
 
 
 # --- plumbing ---------------------------------------------------------------------
@@ -221,9 +234,12 @@ def test_failure_marks_row_for_human_review(conn, cfg, monkeypatch):
     assert stats.failed == 1
 
     row = row_of(conn, msg_id)
-    assert row["action"] == "review"
+    assert row["llm_action"] == "review"  # resume-safe marker
+    assert row["staged_action"] is None  # lands in the needs-decision queue
     assert row["llm_confidence"] == 0.0
     assert "classification failed" in row["llm_reason"]
+    # ... and is NOT re-selected (re-billed) by the next run.
+    assert classifier.classify_messages(conn, cfg, fake_chain()).processed == 0
 
 
 def test_resume_skips_already_classified(conn, cfg):
@@ -267,9 +283,9 @@ def test_mixed_batch_isolates_failures(conn, cfg, monkeypatch):
     stats = classifier.classify_messages(conn, cfg, RunnableLambda(per_subject))
     assert stats.processed == 1
     assert stats.failed == 1
-    assert row_of(conn, good_id)["action"] == "trash"
+    assert row_of(conn, good_id)["staged_action"] == "trash"
     bad_row = row_of(conn, bad_id)
-    assert bad_row["action"] == "review"
+    assert bad_row["staged_action"] is None
     assert bad_row["llm_confidence"] == 0.0
 
 
@@ -337,10 +353,10 @@ def test_interrupt_commits_finished_work_and_drops_the_rest(conn, cfg):
     hit_row = other.execute("SELECT * FROM messages WHERE id=?", (hit_id,)).fetchone()
     other.close()
     assert done_row["llm_confidence"] == 0.95
-    assert done_row["action"] == "trash"
+    assert done_row["staged_action"] == "trash"
     # ... and the interrupted row is untouched, so the next run picks it up.
     assert hit_row["llm_confidence"] is None
-    assert hit_row["action"] is None
+    assert hit_row["llm_action"] is None  # untouched -> next run picks it up
 
 
 def test_progress_ticks_per_message(conn, cfg):

@@ -152,7 +152,7 @@ def approved_message(conn, rfc_id="m1@example.com", action="trash", status="appr
         conn,
         rfc_message_id=rfc_id,
         rule_action=action,
-        action=action,
+        staged_action=action,
         review_status=status,
         decision_source="rule+llm",
         llm_confidence=0.95,
@@ -246,14 +246,14 @@ def test_only_approved_rows_are_consumed(conn, cfg):
     pending = insert_message(
         conn,
         rfc_message_id="p@example.com",
-        action="trash",
+        staged_action="trash",
         rule_action="trash",
         review_status="pending",
     )
     rejected = insert_message(
         conn,
         rfc_message_id="r@example.com",
-        action="trash",
+        staged_action="trash",
         rule_action="trash",
         review_status="rejected",
     )

@@ -12,7 +12,7 @@ import click
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
-from . import db, export, policy, voice_export
+from . import db, export, models, policy, voice_export
 from .config import Config, config_file_path, load_config, write_default_config
 from .ingest import contacts, store
 from .logging_setup import setup_logging
@@ -438,24 +438,28 @@ def status(cfg: Config) -> None:
         "SELECT COUNT(*) FROM messages WHERE ruled_at IS NULL"
     ).fetchone()[0]
     awaiting_llm = conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE action IS NULL AND ruled_at IS NOT NULL"
+        f"SELECT COUNT(*) FROM messages WHERE {models.AWAITING_LLM_WHERE}"
+    ).fetchone()[0]
+    needs_decision = conn.execute(
+        f"SELECT COUNT(*) FROM messages WHERE {models.NEEDS_DECISION_WHERE}"
     ).fetchone()[0]
     click.echo(f"Messages: {total}")
     click.echo(f"Not yet ruled: {unruled}")
     click.echo(f"Awaiting LLM classification: {awaiting_llm}")
+    click.echo(f"Awaiting your decision (review UI): {needs_decision}")
 
     click.echo("\nFinal action / decided by:")
     for row in conn.execute(
-        "SELECT COALESCE(action, '(undecided)') AS a, "
+        "SELECT COALESCE(staged_action, '(undecided)') AS a, "
         "COALESCE(decision_source, '-') AS src, COUNT(*) AS n "
-        "FROM messages GROUP BY action, decision_source ORDER BY n DESC"
+        "FROM messages GROUP BY staged_action, decision_source ORDER BY n DESC"
     ):
         click.echo(f"  {row['a']:12} {row['src']:10} {row['n']}")
 
     click.echo("\nReview status / action:")
     for row in conn.execute(
-        "SELECT review_status, COALESCE(action,'-') AS a, COUNT(*) AS n "
-        "FROM messages GROUP BY review_status, action ORDER BY n DESC"
+        "SELECT review_status, COALESCE(staged_action,'-') AS a, COUNT(*) AS n "
+        "FROM messages GROUP BY review_status, staged_action ORDER BY n DESC"
     ):
         click.echo(f"  {row['review_status']:14} {row['a']:12} {row['n']}")
 

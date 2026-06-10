@@ -5,19 +5,20 @@ from __future__ import annotations
 from ..models import (
     ACTIONABLE_ACTIONS,
     APPROVABLE_STATUSES,
+    NEEDS_DECISION_WHERE,
     sql_in_list,
 )
 
 MESSAGE_COLS = """
     id, date_utc, from_addr, from_domain, subject, rule_name, rule_action,
-    llm_action, llm_category, llm_confidence, llm_reason, action,
+    llm_action, llm_category, llm_confidence, llm_reason, staged_action,
     decision_source, review_status, size_bytes, has_attachments
 """
 
 BY_SENDER = """
 SELECT from_addr, COUNT(*) AS messages,
-       SUM(CASE WHEN action='trash' THEN 1 ELSE 0 END) AS proposed_trash,
-       SUM(CASE WHEN action='archive' THEN 1 ELSE 0 END) AS proposed_archive,
+       SUM(CASE WHEN staged_action='trash' THEN 1 ELSE 0 END) AS proposed_trash,
+       SUM(CASE WHEN staged_action='archive' THEN 1 ELSE 0 END) AS proposed_archive,
        SUM(CASE WHEN review_status='pending' THEN 1 ELSE 0 END) AS pending,
        ROUND(SUM(size_bytes) / 1048576.0, 1) AS total_mb
 FROM messages
@@ -28,8 +29,8 @@ ORDER BY messages DESC
 
 BY_DOMAIN = """
 SELECT from_domain, COUNT(*) AS messages,
-       SUM(CASE WHEN action='trash' THEN 1 ELSE 0 END) AS proposed_trash,
-       SUM(CASE WHEN action='archive' THEN 1 ELSE 0 END) AS proposed_archive,
+       SUM(CASE WHEN staged_action='trash' THEN 1 ELSE 0 END) AS proposed_trash,
+       SUM(CASE WHEN staged_action='archive' THEN 1 ELSE 0 END) AS proposed_archive,
        SUM(CASE WHEN review_status='pending' THEN 1 ELSE 0 END) AS pending,
        ROUND(SUM(size_bytes) / 1048576.0, 1) AS total_mb
 FROM messages
@@ -49,16 +50,16 @@ LIMIT 100
 """
 
 STATUS_COUNTS = """
-SELECT review_status, action, COUNT(*) AS n
-FROM messages GROUP BY review_status, action ORDER BY n DESC
+SELECT review_status, staged_action, COUNT(*) AS n
+FROM messages GROUP BY review_status, staged_action ORDER BY n DESC
 """
 
 #: pipeline funnel: final action x who decided it
 DECISION_COUNTS = """
-SELECT COALESCE(action, '(awaiting LLM)') AS action,
+SELECT COALESCE(staged_action, '(undecided)') AS staged_action,
        COALESCE(decision_source, '-') AS decision_source, COUNT(*) AS n
 FROM messages WHERE ruled_at IS NOT NULL
-GROUP BY action, decision_source ORDER BY n DESC
+GROUP BY staged_action, decision_source ORDER BY n DESC
 """
 
 #: per-rule effectiveness for the Rules page: how often each rule matched,
@@ -103,13 +104,13 @@ FROM actions WHERE message_id = ? ORDER BY id DESC
 # Export: the approved action table as CSV. The WHERE must stay in lockstep
 # with the runner's _SELECT_APPROVED — both build it from the same constants.
 EXPORT_ACTIONS = f"""
-SELECT gmail_msgid AS gmail_message_id, rfc_message_id, action,
+SELECT gmail_msgid AS gmail_message_id, rfc_message_id, staged_action AS action,
        COALESCE(llm_reason, rule_name, 'rule match') AS reason,
        llm_confidence AS confidence,
        review_status, from_addr, subject, date_utc
 FROM messages
 WHERE review_status IN ({sql_in_list(APPROVABLE_STATUSES)})
-  AND action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
+  AND staged_action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
 ORDER BY from_domain, date_epoch
 """
 
@@ -133,12 +134,14 @@ def _message_where(filters: dict) -> tuple[str, list]:
     Recognized keys (all optional):
         fts             : str        -> messages_fts MATCH
         review_status   : list[str]  -> review_status IN (...)
-        action          : list[str]  -> action IN (...)
+        staged_action   : list[str]  -> staged_action IN (...)
         decision_source : list[str]  -> decision_source IN (...)
         rule_name       : list[str]  -> rule_name IN (...)
         llm_category    : list[str]  -> llm_category IN (...)
         no_rule         : bool       -> rule_name IS NULL (ruled, no match)
         disagreement    : bool       -> llm_action != rule_action (both set)
+        needs_decision  : bool       -> undecided with an LLM verdict (a human
+                                        must pick the action)
         conf_lo, conf_hi: float      -> LLM-classified AND llm_confidence >=/<= ?
         date_from, date_to: int      -> date_epoch >=/<= ? (unix seconds, UTC)
         from_addr       : str        -> from_addr LIKE %term%
@@ -163,7 +166,7 @@ def _message_where(filters: dict) -> tuple[str, list]:
             params.extend(values)
 
     _in("review_status", filters.get("review_status"))
-    _in("action", filters.get("action"))
+    _in("staged_action", filters.get("staged_action"))
     _in("decision_source", filters.get("decision_source"))
     _in("rule_name", filters.get("rule_name"))
     _in("llm_category", filters.get("llm_category"))
@@ -175,6 +178,8 @@ def _message_where(filters: dict) -> tuple[str, list]:
             "rule_action IS NOT NULL AND llm_action IS NOT NULL"
             " AND llm_action != rule_action"
         )
+    if filters.get("needs_decision"):
+        where.append(NEEDS_DECISION_WHERE)
 
     lo, hi = filters.get("conf_lo"), filters.get("conf_hi")
     if lo is not None or hi is not None:

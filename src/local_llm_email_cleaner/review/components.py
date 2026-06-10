@@ -82,7 +82,7 @@ MESSAGE_COLUMN_ORDER = [
     "date_utc",
     "from_addr",
     "subject",
-    "action",
+    "staged_action",
     "review_status",
     "rule_name",
     "rule_action",
@@ -101,7 +101,7 @@ MESSAGE_COLUMN_CONFIG = {
     ),
     "from_addr": st.column_config.TextColumn("from", width="medium"),
     "subject": st.column_config.TextColumn("subject", width="large"),
-    "action": st.column_config.TextColumn("action", width="small"),
+    "staged_action": st.column_config.TextColumn("action", width="small"),
     "review_status": st.column_config.TextColumn("status", width="small"),
     "rule_name": st.column_config.TextColumn("rule", width="small"),
     "rule_action": st.column_config.TextColumn("rule says", width="small"),
@@ -224,7 +224,7 @@ def decision_summary(row: sqlite3.Row, hits: list[sqlite3.Row]) -> str:
 
     # LLM stage
     if row["llm_action"] is None:
-        if row["action"] is None:
+        if row["staged_action"] is None:
             lines.append("**LLM:** awaiting classification.")
         elif row["decision_source"] == "rule":
             lines.append("**LLM:** skipped — the rule decided alone.")
@@ -247,7 +247,7 @@ def decision_summary(row: sqlite3.Row, hits: list[sqlite3.Row]) -> str:
 
     # Outcome
     lines.append(
-        f"**Final:** {row['action'] or '(undecided)'} · decided by "
+        f"**Final:** {row['staged_action'] or '(undecided)'} · decided by "
         f"{row['decision_source'] or '—'} · review status "
         f"**{row['review_status']}**"
         + (f" ({row['review_note']})" if row["review_note"] else "")
@@ -351,7 +351,7 @@ def group_table_with_actions(
             r[0]
             for r in conn.execute(
                 f"SELECT id FROM messages WHERE {group_col} IN ({placeholders}) "
-                "AND action=? AND review_status='pending'",
+                "AND staged_action=? AND review_status='pending'",
                 [*groups, action],
             )
         ]

@@ -1,7 +1,11 @@
 """The policy gates — the one place auto-approval can happen.
 
+Human decisions made in the review UI bypass these gates by design (they
+write review_status='approved' directly; the gates only touch 'pending') —
+the runner's reconcile-before-act remains the safety net for them.
+
 Auto-trash (every condition must hold):
-    action == trash, staged by a deterministic rule (rule_action == trash)
+    staged_action == trash, staged by a deterministic rule (rule_action == trash)
     AND LLM confidence >= auto_trash_min_confidence
         (or, when auto_trash_allow_rule_only is enabled, the rule decided
          alone — the one way rule-only trash can auto-approve;
@@ -16,7 +20,7 @@ Auto-trash (every condition must hold):
          auto_trash_ephemeral_min_age_days of grace)
 
 Auto-archive (laxer, because archiving is reversible and labeled in Gmail):
-    action == archive, staged by a deterministic rule (rule_action == archive)
+    staged_action == archive, staged by a deterministic rule (rule_action == archive)
     AND not from a known contact
     AND no keep-voting rule hit and not protect-won
     AND, when the LLM saw it, confidence >= auto_archive_min_confidence
@@ -120,7 +124,7 @@ _NO_KEEP_HIT = f"""
 def _trash_gate_where() -> str:
     return f"""
   review_status='pending'
-  AND action='{Action.TRASH.value}'
+  AND staged_action='{Action.TRASH.value}'
   AND (
         -- staged by a deterministic trash rule AND confirmed by the LLM
         (rule_action='{Action.TRASH.value}'
@@ -153,7 +157,7 @@ def _trash_gate_where() -> str:
 def _archive_gate_where() -> str:
     return f"""
   review_status='pending'
-  AND action='{Action.ARCHIVE.value}'
+  AND staged_action='{Action.ARCHIVE.value}'
   AND (
         -- staged by a deterministic archive rule. A NULL confidence (rule
         -- decided alone) counts as full confidence, so a threshold > 1
@@ -262,10 +266,10 @@ def apply_policy(conn: sqlite3.Connection, params: PolicyParams) -> dict[str, in
     conn.commit()
 
     pending_trash = conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE review_status='pending' AND action='trash'"
+        "SELECT COUNT(*) FROM messages WHERE review_status='pending' AND staged_action='trash'"
     ).fetchone()[0]
     pending_archive = conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE review_status='pending' AND action='archive'"
+        "SELECT COUNT(*) FROM messages WHERE review_status='pending' AND staged_action='archive'"
     ).fetchone()[0]
     logger.info(
         "Policy gates: %d auto-approved for trash (%d left for review), "

@@ -22,11 +22,11 @@ from local_llm_email_cleaner.review.components import df_query, get_cfg, get_con
 _DRY_RUN_FLAG = "apply_dry_run_done"
 
 _APPROVED_SUMMARY = f"""
-SELECT action, review_status, COUNT(*) AS n
+SELECT staged_action, review_status, COUNT(*) AS n
 FROM messages
 WHERE review_status IN ({sql_in_list(APPROVABLE_STATUSES)})
-  AND action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
-GROUP BY action, review_status ORDER BY n DESC
+  AND staged_action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
+GROUP BY staged_action, review_status ORDER BY n DESC
 """
 
 

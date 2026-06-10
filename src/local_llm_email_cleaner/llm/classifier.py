@@ -4,14 +4,14 @@ The population is one line: every ruled message without a final action —
 i.e. rows no rule matched (the LLM suggests the action) plus rows whose
 winning rule asked for confirmation (confirm_with_llm in rules.toml). The
 LLM is deliberately blind to the rule's tentative verdict; agreement
-confirms it, disagreement routes the message to human review
-(models.finalize is the one place that resolution lives).
+confirms it, disagreement leaves the row undecided for the review UI's
+decide buttons (models.finalize is the one place that resolution lives).
 
 Requests are fanned out cfg.llm_concurrency at a time on our own thread
 pool (chain.invoke per message — equivalent to LangChain's batch(), which
 is also just thread-pooled invokes, but lets us cancel queued work on
 Ctrl-C instead of draining it); all SQLite writes stay on the caller's
-thread. Completion is recorded per row (action becomes non-NULL) and
+thread. Completion is recorded per row (llm_action becomes non-NULL) and
 committed per message batch — including on interrupt — so an interrupted
 run resumes for free.
 """
@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from langchain_core.runnables import Runnable
 
 from ..config import Config
-from ..models import Action, DecisionSource, finalize
+from ..models import AWAITING_LLM_WHERE, Action, finalize
 from .prompts import build_inputs
 from .schema import EmailClassification
 
@@ -38,10 +38,10 @@ logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
 
-_SELECT_SQL = """
+_SELECT_SQL = f"""
 SELECT id, from_addr, from_name, subject, date_utc, labels, body_text, rule_action
 FROM messages
-WHERE action IS NULL AND ruled_at IS NOT NULL
+WHERE {AWAITING_LLM_WHERE}
 ORDER BY id
 """
 
@@ -151,17 +151,16 @@ def _updates_for(row: sqlite3.Row, result: EmailClassification) -> tuple:
 _UPDATE_SQL = """
 UPDATE messages
 SET llm_action=?, llm_category=?, llm_confidence=?, llm_reason=?, llm_ephemeral=?,
-    action=?, decision_source=?
+    staged_action=?, decision_source=?
 WHERE id=?
 """
 
-# Confidence 0.0 marks the row done-but-untrusted: action='review' lands it in
-# human review, makes it resume-safe (non-NULL action drops it from
-# re-selection), and can never pass the auto-approval gates.
+# Confidence 0.0 marks the row done-but-untrusted. staged_action stays NULL —
+# the row lands in the needs-decision queue — and the non-NULL llm_action makes
+# it resume-safe (dropped from re-selection) and gate-proof.
 _FAILURE_SQL = f"""
 UPDATE messages
-SET llm_action='{Action.REVIEW.value}', llm_confidence=0.0, llm_reason=?,
-    action='{Action.REVIEW.value}', decision_source='{DecisionSource.LLM.value}'
+SET llm_action='{Action.REVIEW.value}', llm_confidence=0.0, llm_reason=?
 WHERE id=?
 """
 

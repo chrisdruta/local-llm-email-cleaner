@@ -55,10 +55,10 @@ RETRYABLE_NETWORK_ERRORS = (OSError, http.client.HTTPException)
 # Must stay in lockstep with review.queries.EXPORT_ACTIONS — both build the
 # approved-actionable predicate from the same models constants.
 _SELECT_APPROVED = f"""
-SELECT id, gmail_msgid, rfc_message_id, from_addr, subject, date_epoch, action
+SELECT id, gmail_msgid, rfc_message_id, from_addr, subject, date_epoch, staged_action
 FROM messages
 WHERE review_status IN ({sql_in_list(APPROVABLE_STATUSES)})
-  AND action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
+  AND staged_action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
 ORDER BY id
 """
 
@@ -314,7 +314,7 @@ def apply_actions(
 
     for row, rec, rec_err in reconciled_rows():
         stats.examined += 1
-        action = row["action"]
+        action = row["staged_action"]
         if rec_err is not None:
             _insert_action(
                 conn,

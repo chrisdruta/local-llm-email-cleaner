@@ -22,7 +22,7 @@ from local_llm_email_cleaner.review.components import (
 _FILTER_KEYS = {
     "fts": "flt_fts",
     "review_status": "flt_status",
-    "action": "flt_action",
+    "staged_action": "flt_action",
     "decision_source": "flt_source",
     "llm_category": "flt_category",
     "conf": "flt_conf",
@@ -39,7 +39,7 @@ _FILTER_KEYS = {
 _FILTER_DEFAULTS: dict = {
     "fts": "",
     "review_status": [],
-    "action": [],
+    "staged_action": [],
     "decision_source": [],
     "llm_category": [],
     "conf": (0.0, 1.0),
@@ -69,11 +69,11 @@ def _presets() -> dict[str, dict]:
         "LLM uncertain": {"conf": (0.0, cfg.uncertain_confidence_threshold)},
         "No rule matched": {"no_rule": True},
         "Pending trash": {
-            "action": [Action.TRASH.value],
+            "staged_action": [Action.TRASH.value],
             "review_status": [ReviewStatus.PENDING.value],
         },
         "Auto-approved": {"review_status": [ReviewStatus.AUTO_APPROVED.value]},
-        "Oldest trash": {"action": [Action.TRASH.value], "_order": "oldest"},
+        "Oldest trash": {"staged_action": [Action.TRASH.value], "_order": "oldest"},
     }
 
 
@@ -130,8 +130,10 @@ def collect_filters() -> tuple[dict, str]:
     review_status = c[0].multiselect(
         "Status", [s.value for s in ReviewStatus], key=_FILTER_KEYS["review_status"]
     )
-    action = c[1].multiselect(
-        "Action", [a.value for a in Action], key=_FILTER_KEYS["action"]
+    staged_action = c[1].multiselect(
+        "Action",
+        [a.value for a in Action if a != Action.REVIEW],
+        key=_FILTER_KEYS["staged_action"],
     )
     decision_source = c[2].multiselect(
         "Decided by",
@@ -152,7 +154,7 @@ def collect_filters() -> tuple[dict, str]:
     filters: dict = {
         "fts": fts,
         "review_status": review_status,
-        "action": action,
+        "staged_action": staged_action,
         "decision_source": decision_source,
         "llm_category": llm_category,
         "from_addr": from_addr,

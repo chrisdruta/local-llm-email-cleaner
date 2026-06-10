@@ -218,29 +218,29 @@ def test_run_rules_end_to_end(conn, mbox_path, cfg, default_ruleset):
 
     def row(message_id: str):
         return conn.execute(
-            "SELECT rule_name, rule_action, rule_protected, action, decision_source "
+            "SELECT rule_name, rule_action, rule_protected, staged_action, decision_source "
             "FROM messages WHERE rfc_message_id=?",
             (message_id,),
         ).fetchone()
 
     friend = row("friend-1@example.com")
     assert friend["rule_name"] == "known_contact"
-    assert friend["action"] == "keep" and friend["decision_source"] == "rule"
+    assert friend["staged_action"] == "keep" and friend["decision_source"] == "rule"
     assert friend["rule_protected"] == 1
 
     bank = row("bank-1@example.com")  # keyword keep, awaiting LLM confirmation
     assert bank["rule_name"] == "financial_legal_medical"
-    assert bank["rule_action"] == "keep" and bank["action"] is None
+    assert bank["rule_action"] == "keep" and bank["staged_action"] is None
 
     promo = row("promo-1@example.com")
     assert promo["rule_name"] == "promotional_label"
-    assert promo["rule_action"] == "trash" and promo["action"] is None
+    assert promo["rule_action"] == "trash" and promo["staged_action"] is None
 
     ship = row("ship-1@example.com")  # shipping outranks noreply by file order
     assert ship["rule_name"] == "shipping"
 
     photos = row("photos-1@example.com")  # no rule matched -> LLM
-    assert photos["rule_name"] is None and photos["action"] is None
+    assert photos["rule_name"] is None and photos["staged_action"] is None
 
     # All matches recorded; the winner flagged.
     hits = conn.execute(
@@ -269,12 +269,12 @@ def test_run_rules_decides_voice_alone(conn, default_ruleset):
     engine.run_rules(conn, default_ruleset, RuleContext())
 
     row = conn.execute(
-        "SELECT rule_name, rule_action, action, decision_source, llm_action "
+        "SELECT rule_name, rule_action, staged_action, decision_source, llm_action "
         "FROM messages WHERE id=?",
         (mid,),
     ).fetchone()
     assert row["rule_name"] == "voice"
-    assert row["action"] == "trash" and row["decision_source"] == "rule"
+    assert row["staged_action"] == "trash" and row["decision_source"] == "rule"
     assert row["llm_action"] is None  # never sent to the LLM
 
 
@@ -326,7 +326,7 @@ def test_reset_preserves_llm_verdicts_and_refinalizes(conn, tmp_path, default_ru
     # Simulate the classifier having confirmed the promo as trash.
     conn.execute(
         "UPDATE messages SET llm_action='trash', llm_category='promotion', "
-        "llm_confidence=0.97, llm_reason='obvious promo', action='trash', "
+        "llm_confidence=0.97, llm_reason='obvious promo', staged_action='trash', "
         "decision_source='rule+llm' WHERE id=?",
         (mid,),
     )
@@ -336,14 +336,14 @@ def test_reset_preserves_llm_verdicts_and_refinalizes(conn, tmp_path, default_ru
     # the stored verdict without going back to the LLM.
     engine.run_rules(conn, default_ruleset, ctx, reset=True)
     row = conn.execute(
-        "SELECT action, decision_source, llm_confidence FROM messages WHERE id=?",
+        "SELECT staged_action, decision_source, llm_confidence FROM messages WHERE id=?",
         (mid,),
     ).fetchone()
-    assert row["action"] == "trash" and row["decision_source"] == "rule+llm"
+    assert row["staged_action"] == "trash" and row["decision_source"] == "rule+llm"
     assert row["llm_confidence"] == 0.97
 
     # A tuning pass that flips the rule to archive now DISAGREES with the
-    # stored trash verdict -> review, still no LLM re-run.
+    # stored trash verdict -> undecided (a human picks), still no LLM re-run.
     flipped = make_ruleset(
         tmp_path,
         """
@@ -357,17 +357,18 @@ def test_reset_preserves_llm_verdicts_and_refinalizes(conn, tmp_path, default_ru
     )
     engine.run_rules(conn, flipped, ctx, reset=True)
     row = conn.execute(
-        "SELECT rule_action, action, decision_source FROM messages WHERE id=?", (mid,)
+        "SELECT rule_action, staged_action, decision_source FROM messages WHERE id=?",
+        (mid,),
     ).fetchone()
     assert row["rule_action"] == "archive"
-    assert row["action"] == "review" and row["decision_source"] == "rule+llm"
+    assert row["staged_action"] is None and row["decision_source"] is None
 
     # --reset --full wipes the verdicts too: back to awaiting the LLM.
     engine.run_rules(conn, flipped, ctx, reset=True, full=True)
     row = conn.execute(
-        "SELECT llm_action, action FROM messages WHERE id=?", (mid,)
+        "SELECT llm_action, staged_action FROM messages WHERE id=?", (mid,)
     ).fetchone()
-    assert row["llm_action"] is None and row["action"] is None
+    assert row["llm_action"] is None and row["staged_action"] is None
 
 
 def test_finalize_with_stored_llm_no_rule_uses_llm_action(conn):
@@ -379,9 +380,9 @@ def test_finalize_with_stored_llm_no_rule_uses_llm_action(conn):
     )
     assert engine.finalize_with_stored_llm(conn) == 1
     row = conn.execute(
-        "SELECT action, decision_source FROM messages WHERE id=?", (mid,)
+        "SELECT staged_action, decision_source FROM messages WHERE id=?", (mid,)
     ).fetchone()
-    assert row["action"] == "archive" and row["decision_source"] == "llm"
+    assert row["staged_action"] == "archive" and row["decision_source"] == "llm"
 
 
 def test_run_rules_commits_per_chunk(conn, mbox_path, monkeypatch, default_ruleset):

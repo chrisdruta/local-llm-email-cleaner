@@ -26,7 +26,7 @@ def eligible_row(conn, **overrides) -> int:
         rule_action="trash",
         llm_action="trash",
         llm_confidence=0.95,
-        action="trash",
+        staged_action="trash",
         decision_source="rule+llm",
         has_attachments=0,
     )
@@ -91,7 +91,7 @@ def llm_only_row(conn, action="trash", confidence=0.99, **overrides) -> int:
         ruled_at=RULED,
         llm_action=action,
         llm_confidence=confidence,
-        action=action,
+        staged_action=action,
         decision_source="llm",
         **overrides,
     )
@@ -265,7 +265,7 @@ def archive_row(conn, *, rule_hit: bool = True, **overrides) -> int:
         ruled_at=RULED,
         rule_name="receipt",
         rule_action="archive",
-        action="archive",
+        staged_action="archive",
         decision_source="rule",
         llm_confidence=None,
     )
@@ -308,7 +308,7 @@ def test_archive_gate_requires_rule_or_the_llm_only_bar(conn, cfg):
         ruled_at=RULED,
         llm_action="archive",
         llm_confidence=0.9,
-        action="archive",
+        staged_action="archive",
         decision_source="llm",
     )
     policy.apply_policy(conn, params(cfg))

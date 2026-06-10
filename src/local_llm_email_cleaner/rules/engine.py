@@ -10,11 +10,12 @@ by name):
    (compile_ruleset already yields rules in that order, so the first match
    wins).
 3. A winner with protect, or with confirm_with_llm = false, decides alone:
-   action is finalized with decision_source='rule'. A winner that wants LLM
-   confirmation writes only its rule_* verdict and leaves action NULL.
+   staged_action is finalized with decision_source='rule'. A winner that wants
+   LLM confirmation writes only its rule_* verdict, staged_action stays NULL.
 4. No match at all -> only ruled_at is set; the LLM suggests the action.
 
-"Awaiting LLM" is therefore `action IS NULL AND ruled_at IS NOT NULL`.
+"Awaiting LLM" is models.AWAITING_LLM_WHERE; human decisions made in the
+review UI live on approved rows, which reset (pending-only) never touches.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ BATCH_SIZE = 500
 _UPDATE_SQL = """
 UPDATE messages
 SET ruled_at=datetime('now'), rule_name=?, rule_action=?, rule_category=?,
-    rule_protected=?, rule_ephemeral=?, action=?, decision_source=?
+    rule_protected=?, rule_ephemeral=?, staged_action=?, decision_source=?
 WHERE id=?
 """
 
@@ -46,7 +47,7 @@ _INSERT_HIT_SQL = (
 #: decision columns owned by the rules stage, reset together
 _RESET_RULE_COLS = """
 ruled_at=NULL, rule_name=NULL, rule_action=NULL, rule_category=NULL,
-rule_protected=0, rule_ephemeral=0, action=NULL, decision_source=NULL
+rule_protected=0, rule_ephemeral=0, staged_action=NULL, decision_source=NULL
 """
 
 _RESET_LLM_COLS = """
@@ -176,20 +177,27 @@ def finalize_with_stored_llm(conn: sqlite3.Connection) -> int:
     rows = conn.execute(
         """
         SELECT id, rule_action, llm_action FROM messages
-        WHERE action IS NULL AND ruled_at IS NOT NULL AND llm_action IS NOT NULL
+        WHERE staged_action IS NULL AND ruled_at IS NOT NULL
+          AND llm_action IS NOT NULL
         """
     ).fetchall()
     if not rows:
         return 0
     updates = []
+    decided = 0
     for row in rows:
         action, source = finalize(row["rule_action"], row["llm_action"])
+        if action is None:
+            continue  # still a disagreement — stays in the needs-decision queue
+        decided += 1
         updates.append((action, source, row["id"]))
-    conn.executemany(
-        "UPDATE messages SET action=?, decision_source=? WHERE id=?", updates
-    )
-    conn.commit()
-    return len(rows)
+    if updates:
+        conn.executemany(
+            "UPDATE messages SET staged_action=?, decision_source=? WHERE id=?",
+            updates,
+        )
+        conn.commit()
+    return decided
 
 
 def load_context(conn: sqlite3.Connection) -> RuleContext:
