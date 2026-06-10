@@ -1,4 +1,19 @@
-"""Core enums and dataclasses shared across pipeline stages."""
+"""Core enums and dataclasses shared across pipeline stages.
+
+The v3 decision lifecycle, one writer per column:
+
+  ingest   -> identity/content columns; review_status defaults to 'pending'
+  rules    -> ruled_at + rule_* (and, when the winning rule decides alone,
+              action + decision_source='rule'); every match goes to rule_hits
+  classify -> llm_* + action + decision_source ('llm' when no rule matched,
+              'rule+llm' when confirming a rule; disagreement -> 'review')
+  policy   -> review_status pending <-> auto_approved (the only auto-approval)
+  review   -> review_status approved / rejected (human)
+  runner   -> review_status applied / skipped (after Gmail reconcile+mutate)
+
+"Awaiting LLM classification" is simply `action IS NULL AND ruled_at IS NOT
+NULL` — no shared predicate machinery.
+"""
 
 from __future__ import annotations
 
@@ -6,19 +21,26 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 
-class StagedLabel(StrEnum):
-    KEEP = "KEEP"
-    DELETE_CANDIDATE = "DELETE_CANDIDATE"
-    ARCHIVE_CANDIDATE = "ARCHIVE_CANDIDATE"
-    UNSUBSCRIBE_CANDIDATE = "UNSUBSCRIBE_CANDIDATE"
-    NEEDS_REVIEW = "NEEDS_REVIEW"
+class Action(StrEnum):
+    """The single action vocabulary, shared by rules, the LLM, and the runner.
 
+    REVIEW means "a human must decide" — rules never stage it (a rule that
+    can't decide shouldn't match), but the LLM may return it and a
+    rule-vs-LLM disagreement resolves to it.
+    """
 
-class ProposedAction(StrEnum):
     KEEP = "keep"
     ARCHIVE = "archive"
     TRASH = "trash"
     REVIEW = "review"
+
+
+class DecisionSource(StrEnum):
+    """Who produced messages.action."""
+
+    RULE = "rule"  # a rule decided alone (protect, or confirm_with_llm=false)
+    LLM = "llm"  # no rule matched; the LLM's suggestion stands
+    RULE_LLM = "rule+llm"  # rule staged it, LLM weighed in (confirm or dispute)
 
 
 class ReviewStatus(StrEnum):
@@ -28,11 +50,6 @@ class ReviewStatus(StrEnum):
     REJECTED = "rejected"
     APPLIED = "applied"
     SKIPPED = "skipped"
-
-
-class RuleKind(StrEnum):
-    PROTECTION = "protection"
-    CANDIDATE = "candidate"
 
 
 class ActionStatus(StrEnum):
@@ -52,8 +69,8 @@ class ActionStatus(StrEnum):
 
 #: actions the runner will execute (everything else is review-only)
 ACTIONABLE_ACTIONS: tuple[str, ...] = (
-    ProposedAction.TRASH.value,
-    ProposedAction.ARCHIVE.value,
+    Action.TRASH.value,
+    Action.ARCHIVE.value,
 )
 
 #: review statuses the runner (and the export preview) treat as approved
@@ -62,62 +79,22 @@ APPROVABLE_STATUSES: tuple[str, ...] = (
     ReviewStatus.AUTO_APPROVED.value,
 )
 
-#: messages.classified_by values — written by the rules engine / classifier
-CLASSIFIED_BY_RULES = "rules"
-CLASSIFIED_BY_LLM = "llm"
-CLASSIFIED_BY_RULES_LLM = "rules+llm"
-#: messages dispositioned by the Google Voice export (backed up to disk, then
-#: staged for trash). Distinct so the LLM classifier skips them even though
-#: they are DELETE_CANDIDATEs — they were decided by the export, not the rules.
-CLASSIFIED_BY_VOICE = "voice"
 
-#: classified_by values that carry an LLM verdict (both must match wherever
-#: "seen by the LLM" is filtered — equality to 'llm' alone would be a bug)
-LLM_CLASSIFIERS: tuple[str, ...] = (CLASSIFIED_BY_LLM, CLASSIFIED_BY_RULES_LLM)
+def finalize(rule_action: str | None, llm_action: str) -> tuple[str, str]:
+    """Resolve a message's final (action, decision_source) once the LLM has
+    spoken. The one place rule-vs-LLM agreement is decided:
 
-#: rule_name of the sole ABSOLUTE protection rule. Keyword-protected KEEPs get
-#: a second opinion from the LLM (the financial/security keyword rules over-
-#: match promo footers), but a known contact is never reviewed back down. Shared
-#: so protection_rules and the classifier predicate can't drift on the name.
-KNOWN_CONTACT_RULE = "known_contact"
-
-#: The population the LLM classifier processes: rule-ambiguous rows (NEEDS_REVIEW
-#: with no classification yet); rule-staged delete/archive candidates that still
-#: need a second opinion; and keyword-protected KEEPs (a financial/security
-#: keyword rule fired, but those rules over-match promo footers, so the LLM
-#: re-checks them — it may pull an obvious promo down to archive/trash, which
-#: still reaches a human because the protection rule_hit keeps it out of the
-#: auto-approval gates). Excludes voice rows (decided by the export, backed up
-#: to disk), KEEPs from a known contact (the one absolute protection — never
-#: reviewed down), and anything already scored. Lives here, not in the
-#: langchain-importing classifier module, so `status` can count the SAME
-#: predicate without paying that import; the two must never drift on what
-#: "awaiting LLM classification" means.
-PENDING_CLASSIFICATION_WHERE = """
-review_status='pending' AND ai_confidence IS NULL
-  AND (
-        (staged_label=:needs_review AND classified_by IS NULL)
-     OR ((staged_label=:delete_candidate OR staged_label=:archive_candidate)
-         AND classified_by IS NOT :voice)
-     OR (staged_label=:keep
-         AND EXISTS (SELECT 1 FROM rule_hits h
-                     WHERE h.message_id = messages.id AND h.rule_kind = 'protection')
-         AND NOT EXISTS (SELECT 1 FROM rule_hits h
-                     WHERE h.message_id = messages.id AND h.rule_name = :known_contact))
-  )
-"""
-
-
-def pending_classification_params() -> dict[str, str]:
-    """Named-parameter bindings for :data:`PENDING_CLASSIFICATION_WHERE`."""
-    return {
-        "needs_review": StagedLabel.NEEDS_REVIEW.value,
-        "delete_candidate": StagedLabel.DELETE_CANDIDATE.value,
-        "archive_candidate": StagedLabel.ARCHIVE_CANDIDATE.value,
-        "keep": StagedLabel.KEEP.value,
-        "voice": CLASSIFIED_BY_VOICE,
-        "known_contact": KNOWN_CONTACT_RULE,
-    }
+    - no rule matched          -> the LLM's suggestion stands
+    - LLM agrees with the rule -> confirmed
+    - disagreement             -> a human decides (strict equality; the LLM is
+                                  deliberately blind to the rule's verdict, so
+                                  agreement is meaningful)
+    """
+    if rule_action is None:
+        return llm_action, DecisionSource.LLM.value
+    if rule_action == llm_action:
+        return rule_action, DecisionSource.RULE_LLM.value
+    return Action.REVIEW.value, DecisionSource.RULE_LLM.value
 
 
 def sql_in_list(values: tuple[str, ...]) -> str:
@@ -136,36 +113,10 @@ def split_labels(raw: str | None) -> set[str]:
     return {part.strip().lower() for part in raw.split(",") if part.strip()}
 
 
-#: staged label -> default proposed action
-ACTION_FOR_LABEL: dict[StagedLabel, ProposedAction] = {
-    StagedLabel.KEEP: ProposedAction.KEEP,
-    StagedLabel.DELETE_CANDIDATE: ProposedAction.TRASH,
-    StagedLabel.ARCHIVE_CANDIDATE: ProposedAction.ARCHIVE,
-    StagedLabel.UNSUBSCRIBE_CANDIDATE: ProposedAction.REVIEW,
-    StagedLabel.NEEDS_REVIEW: ProposedAction.REVIEW,
-}
-
-#: LLM action string -> staged label
-LABEL_FOR_LLM_ACTION: dict[str, StagedLabel] = {
-    "keep": StagedLabel.KEEP,
-    "archive": StagedLabel.ARCHIVE_CANDIDATE,
-    "trash": StagedLabel.DELETE_CANDIDATE,
-    "review": StagedLabel.NEEDS_REVIEW,
-}
-
-# The LLM action vocabulary is declared three times (the Literal in
-# llm/schema.py, the dict keys above, and ProposedAction); fail loudly at
-# import if they ever drift.
-assert set(LABEL_FOR_LLM_ACTION) == {a.value for a in ProposedAction}, (
-    "LABEL_FOR_LLM_ACTION keys must match ProposedAction values"
-)
-
-#: Canonical ai_category slugs. The LLM is constrained to these (Literal in
+#: Canonical llm_category slugs. The LLM is constrained to these (Literal in
 #: llm/schema.py) so the column stays a small, groupable vocabulary instead of
-#: free text; the rules engine's candidate/protection categories are a subset
-#: (asserted in tests). "digest" marks timely/disposable roundups (see the
-#: `ephemeral` flag). Voice-export writes its own "voice_*" slugs directly and
-#: is intentionally outside this set.
+#: free text. Rule categories (rules.toml) are free strings and usually a
+#: subset. "digest" marks timely/disposable roundups (see the ephemeral flags).
 CATEGORIES: tuple[str, ...] = (
     "promotion",
     "newsletter",
@@ -205,24 +156,3 @@ class ParsedMessage:
     attachment_names: list[str] = field(default_factory=list)
     size_bytes: int | None = None
     list_unsubscribe: bool = False
-
-
-@dataclass(frozen=True)
-class RuleVote:
-    """The outcome a single rule votes for on a message.
-
-    The disposition is carried as data, not inferred from rule_name: a vote can
-    declare itself ephemeral (digest-style, disposable regardless of age),
-    skip_llm (decided deterministically, never sent to the classifier), and a
-    priority that overrides the staged_label precedence when it fires.
-    """
-
-    rule_name: str
-    rule_kind: RuleKind
-    staged_label: StagedLabel
-    category: str
-    ephemeral: bool = False
-    skip_llm: bool = False
-    #: higher wins outright over staged_label precedence (e.g. voice > digest >
-    #: the ordinary ARCHIVE > DELETE > UNSUBSCRIBE ordering at priority 0)
-    priority: int = 0

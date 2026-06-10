@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
-from conftest import insert_message
+from conftest import add_rule_hit, insert_message
 
 from local_llm_email_cleaner.review import queries
 
@@ -55,3 +55,72 @@ def test_order_oldest_first(conn):
 
     sql, params = queries.build_message_query({}, order="default")
     assert [r["id"] for r in conn.execute(sql, params)] == [a, c, b]
+
+
+RULED = "2026-01-01T00:00:00"
+
+
+def test_disagreement_filter_and_query(conn):
+    agree = insert_message(  # noqa: F841 — must NOT appear in results
+        conn,
+        ruled_at=RULED,
+        rule_action="trash",
+        llm_action="trash",
+        action="trash",
+    )
+    disagree = insert_message(
+        conn,
+        ruled_at=RULED,
+        rule_action="trash",
+        llm_action="keep",
+        action="review",
+        rfc_message_id="d@x",
+    )
+    llm_only = insert_message(  # noqa: F841 — no rule verdict, not a disagreement
+        conn, ruled_at=RULED, llm_action="keep", action="keep", rfc_message_id="l@x"
+    )
+
+    sql, params = queries.build_message_query({"disagreement": True})
+    assert [r["id"] for r in conn.execute(sql, params)] == [disagree]
+    assert [r["id"] for r in conn.execute(queries.DISAGREEMENTS)] == [disagree]
+
+
+def test_no_rule_filter_excludes_unruled_rows(conn):
+    unruled = insert_message(conn)  # noqa: F841 — rules haven't run
+    no_match = insert_message(conn, ruled_at=RULED, rfc_message_id="n@x")
+    matched = insert_message(  # noqa: F841
+        conn, ruled_at=RULED, rule_name="receipt", rfc_message_id="m@x"
+    )
+    sql, params = queries.build_message_query({"no_rule": True})
+    assert [r["id"] for r in conn.execute(sql, params)] == [no_match]
+
+
+def test_confidence_filter_requires_llm_verdict(conn):
+    rule_only = insert_message(conn, ruled_at=RULED, rule_action="trash")  # noqa: F841
+    scored = insert_message(
+        conn, ruled_at=RULED, llm_confidence=0.6, rfc_message_id="s@x"
+    )
+    sql, params = queries.build_message_query({"conf_lo": 0.0, "conf_hi": 0.7})
+    assert [r["id"] for r in conn.execute(sql, params)] == [scored]
+
+
+def test_rule_stats_counts_hits_wins_and_lifecycle(conn):
+    won = insert_message(conn, ruled_at=RULED, rule_name="digest")
+    add_rule_hit(conn, won, "trash", "digest", won=True)
+    add_rule_hit(conn, won, "archive", "updates_label", won=False)
+    other = insert_message(
+        conn,
+        ruled_at=RULED,
+        rule_name="digest",
+        review_status="auto_approved",
+        rfc_message_id="o@x",
+    )
+    add_rule_hit(conn, other, "trash", "digest", won=True)
+
+    stats = {r["rule_name"]: r for r in conn.execute(queries.RULE_STATS)}
+    assert stats["digest"]["hits"] == 2
+    assert stats["digest"]["wins"] == 2
+    assert stats["digest"]["wins_pending"] == 1
+    assert stats["digest"]["wins_approved"] == 1
+    assert stats["updates_label"]["hits"] == 1
+    assert stats["updates_label"]["wins"] == 0

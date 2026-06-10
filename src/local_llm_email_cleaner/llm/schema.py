@@ -6,7 +6,7 @@ from typing import Literal, get_args
 
 from pydantic import BaseModel, Field
 
-from ..models import CATEGORIES, ProposedAction
+from ..models import CATEGORIES, Action
 
 
 class EmailClassification(BaseModel):
@@ -37,8 +37,7 @@ class EmailClassification(BaseModel):
     reason: str = Field(description="One short sentence explaining the decision")
 
 
-# The action Literal must stay in lockstep with ProposedAction (and with
-# models.LABEL_FOR_LLM_ACTION, which models.py asserts against the enum).
+# The action Literal must stay in lockstep with models.Action.
 assert set(get_args(EmailClassification.model_fields["action"].annotation)) == {
-    a.value for a in ProposedAction
-}, "EmailClassification.action Literal must match ProposedAction values"
+    a.value for a in Action
+}, "EmailClassification.action Literal must match Action values"

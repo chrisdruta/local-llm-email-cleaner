@@ -24,7 +24,7 @@ flagged ``"exported": false`` rather than failing.
 
 This module only writes the disk backup; the on-disk files are rewritten in
 full on every run, so re-running is idempotent. Staging these messages for
-trash is the ``voice`` candidate rule's job (see ``rules/candidate_rules.py``)
+trash is the ``voice`` rule's job (see rules.toml)
 and happens in the ``rules`` stage, not here.
 """
 

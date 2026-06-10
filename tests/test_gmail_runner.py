@@ -151,11 +151,11 @@ def approved_message(conn, rfc_id="m1@example.com", action="trash", status="appr
     return insert_message(
         conn,
         rfc_message_id=rfc_id,
-        staged_label="DELETE_CANDIDATE",
-        proposed_action=action,
+        rule_action=action,
+        action=action,
         review_status=status,
-        classified_by="rules+llm",
-        ai_confidence=0.95,
+        decision_source="rule+llm",
+        llm_confidence=0.95,
     )
 
 
@@ -246,15 +246,15 @@ def test_only_approved_rows_are_consumed(conn, cfg):
     pending = insert_message(
         conn,
         rfc_message_id="p@example.com",
-        proposed_action="trash",
-        staged_label="DELETE_CANDIDATE",
+        action="trash",
+        rule_action="trash",
         review_status="pending",
     )
     rejected = insert_message(
         conn,
         rfc_message_id="r@example.com",
-        proposed_action="trash",
-        staged_label="DELETE_CANDIDATE",
+        action="trash",
+        rule_action="trash",
         review_status="rejected",
     )
     auto = approved_message(conn, rfc_id="a@example.com", status="auto_approved")

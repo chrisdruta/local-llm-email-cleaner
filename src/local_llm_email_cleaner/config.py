@@ -20,6 +20,9 @@ db = "data/email.db"
 mbox = "data/takeout.mbox"
 credentials = "secrets/credentials.json"
 token = "secrets/token.json"
+# Deterministic staging rules (the user-tunable source of truth) — see the
+# comments in the file itself. Validate edits with `email-cleaner rules --check`.
+rules = "rules.toml"
 
 [ollama]
 # From inside the devcontainer, the Windows-host Ollama server is reachable via
@@ -49,6 +52,10 @@ auto_trash_ephemeral_min_age_days = 7
 # Applies to rule-staged archive candidates and, when the LLM weighed in, only
 # above this confidence. Set to a value > 1 to disable auto-archive entirely.
 auto_archive_min_confidence = 0.80
+# Let trash rules with confirm_with_llm = false auto-approve without any LLM
+# confidence. Off by default — rule-only trash (including Google Voice records)
+# then always needs explicit human approval in review.
+auto_trash_allow_rule_only = false
 
 [gmail]
 oauth_port = 8765
@@ -72,6 +79,7 @@ class Config:
     mbox_path: Path
     credentials_path: Path
     token_path: Path
+    rules_path: Path
     # ollama
     ollama_url: str
     ollama_model: str
@@ -86,6 +94,7 @@ class Config:
     auto_trash_min_age_months: int
     auto_trash_ephemeral_min_age_days: int
     auto_archive_min_confidence: float
+    auto_trash_allow_rule_only: bool
     # gmail
     oauth_port: int
     requests_per_second: float
@@ -100,6 +109,7 @@ DEFAULTS = Config(
     mbox_path=Path("data/takeout.mbox"),
     credentials_path=Path("secrets/credentials.json"),
     token_path=Path("secrets/token.json"),
+    rules_path=Path("rules.toml"),
     ollama_url="http://host.docker.internal:11434",
     ollama_model="gemma4:e4b-it-q8_0",
     max_body_chars=3000,
@@ -111,6 +121,7 @@ DEFAULTS = Config(
     auto_trash_min_age_months=12,
     auto_trash_ephemeral_min_age_days=7,
     auto_archive_min_confidence=0.80,
+    auto_trash_allow_rule_only=False,
     oauth_port=8765,
     requests_per_second=5.0,
     uncertain_confidence_threshold=0.75,
@@ -132,6 +143,7 @@ def _from_toml(cfg: Config, data: dict) -> Config:
         mbox_path=Path(paths.get("mbox", cfg.mbox_path)),
         credentials_path=Path(paths.get("credentials", cfg.credentials_path)),
         token_path=Path(paths.get("token", cfg.token_path)),
+        rules_path=Path(paths.get("rules", cfg.rules_path)),
         ollama_url=ollama.get("url", cfg.ollama_url),
         ollama_model=ollama.get("model", cfg.ollama_model),
         max_body_chars=int(ollama.get("max_body_chars", cfg.max_body_chars)),
@@ -156,6 +168,9 @@ def _from_toml(cfg: Config, data: dict) -> Config:
         ),
         auto_archive_min_confidence=float(
             policy.get("auto_archive_min_confidence", cfg.auto_archive_min_confidence)
+        ),
+        auto_trash_allow_rule_only=bool(
+            policy.get("auto_trash_allow_rule_only", cfg.auto_trash_allow_rule_only)
         ),
         oauth_port=int(gmail.get("oauth_port", cfg.oauth_port)),
         requests_per_second=float(

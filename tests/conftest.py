@@ -290,13 +290,19 @@ def insert_message(conn: sqlite3.Connection, **overrides) -> int:
         "attachment_names": "[]",
         "size_bytes": 1000,
         "list_unsubscribe": 0,
-        "ephemeral": 0,
-        "ai_category": None,
-        "ai_confidence": None,
-        "ai_reason": None,
-        "classified_by": None,
-        "staged_label": None,
-        "proposed_action": None,
+        "ruled_at": None,
+        "rule_name": None,
+        "rule_action": None,
+        "rule_category": None,
+        "rule_protected": 0,
+        "rule_ephemeral": 0,
+        "llm_action": None,
+        "llm_category": None,
+        "llm_confidence": None,
+        "llm_reason": None,
+        "llm_ephemeral": 0,
+        "action": None,
+        "decision_source": None,
         "review_status": "pending",
     }
     row.update(overrides)
@@ -308,10 +314,39 @@ def insert_message(conn: sqlite3.Connection, **overrides) -> int:
 
 
 def add_rule_hit(
-    conn: sqlite3.Connection, message_id: int, kind: str, name: str = "x"
+    conn: sqlite3.Connection,
+    message_id: int,
+    action: str = "trash",
+    name: str = "x",
+    won: bool = False,
 ) -> None:
     conn.execute(
-        "INSERT INTO rule_hits (message_id, rule_name, rule_kind, outcome) VALUES (?, ?, ?, ?)",
-        (message_id, name, kind, "DELETE_CANDIDATE" if kind == "candidate" else "KEEP"),
+        "INSERT INTO rule_hits (message_id, rule_name, action, won) VALUES (?, ?, ?, ?)",
+        (message_id, name, action, int(won)),
     )
     conn.commit()
+
+
+def make_ruleset(tmp_path: Path, toml_text: str):
+    """Load a RuleSet from inline TOML (shared helper for rule-driven tests)."""
+    from local_llm_email_cleaner.rules.ruleset import load_ruleset
+
+    path = tmp_path / "inline_rules.toml"
+    path.write_text(toml_text, encoding="utf-8")
+    return load_ruleset(path)
+
+
+@pytest.fixture
+def default_ruleset():
+    """The packaged starter rules.toml, parsed."""
+    import tomllib
+    from importlib import resources
+
+    from local_llm_email_cleaner.rules.ruleset import RuleSet
+
+    raw = tomllib.loads(
+        resources.files("local_llm_email_cleaner")
+        .joinpath("rules/default_rules.toml")
+        .read_text(encoding="utf-8")
+    )
+    return RuleSet.model_validate(raw)

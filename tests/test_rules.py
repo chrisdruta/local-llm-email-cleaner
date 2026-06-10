@@ -1,13 +1,15 @@
-"""Rules engine: protection wins, candidates staged, hits recorded."""
+"""Rules engine: priority wins, hits recorded, LLM-confirm rows left open."""
 
 from __future__ import annotations
 
-from conftest import FRIEND_ADDR
+from conftest import FRIEND_ADDR, insert_message, make_ruleset
 
 from local_llm_email_cleaner.ingest import contacts, store
-from local_llm_email_cleaner.models import CLASSIFIED_BY_VOICE, StagedLabel
 from local_llm_email_cleaner.rules import engine
+from local_llm_email_cleaner.rules.matcher import compile_ruleset
 from local_llm_email_cleaner.rules.views import MessageView, RuleContext
+
+CTX = RuleContext(known_contacts=frozenset({FRIEND_ADDR}))
 
 
 def make_view(**overrides) -> MessageView:
@@ -24,406 +26,259 @@ def make_view(**overrides) -> MessageView:
     return MessageView(**defaults)
 
 
-class TestEvaluateMessage:
-    ctx = RuleContext(known_contacts=frozenset({FRIEND_ADDR}))
+class TestEvaluateAgainstDefaultRules:
+    """The packaged default ruleset reproduces the v2 staging behavior."""
+
+    import pytest
+
+    @pytest.fixture(autouse=True)
+    def _compile(self, default_ruleset):
+        self.compiled = compile_ruleset(default_ruleset)
+
+    def winner(self, view: MessageView):
+        hits = engine.evaluate_message(view, CTX, self.compiled)
+        return hits[0].rule if hits else None
+
+    def hit_names(self, view: MessageView) -> set[str]:
+        return {h.name for h in engine.evaluate_message(view, CTX, self.compiled)}
 
     def test_known_contact_protected(self):
-        result = engine.evaluate_message(make_view(from_addr=FRIEND_ADDR), self.ctx)
-        assert result.staged_label == StagedLabel.KEEP
-        assert any(h.rule_name == "known_contact" for h in result.hits)
+        winner = self.winner(make_view(from_addr=FRIEND_ADDR))
+        assert winner.name == "known_contact"
+        assert winner.protect and winner.action == "keep"
 
-    def test_financial_subject_protected(self):
-        result = engine.evaluate_message(
-            make_view(subject="Your 2023 tax documents are ready"), self.ctx
+    def test_financial_subject_keep(self):
+        winner = self.winner(make_view(subject="Your 2023 tax documents are ready"))
+        assert winner.name == "financial_legal_medical"
+        assert winner.action == "keep" and winner.confirm_with_llm
+
+    def test_security_alert_keep(self):
+        winner = self.winner(
+            make_view(subject="Security alert: new sign-in from Windows")
         )
-        assert result.staged_label == StagedLabel.KEEP
-        assert result.category == "financial_legal_medical"
+        assert winner.name == "security_alert"
 
-    def test_security_alert_protected(self):
-        result = engine.evaluate_message(
-            make_view(subject="Security alert: new sign-in from Windows"), self.ctx
-        )
-        assert result.staged_label == StagedLabel.KEEP
-
-    def test_financial_body_protected_despite_innocuous_subject(self):
-        # The sensitive substance is only in the body; a noreply sender would
-        # otherwise stage this DELETE_CANDIDATE. Body scan -> KEEP.
-        result = engine.evaluate_message(
+    def test_financial_body_despite_innocuous_subject(self):
+        winner = self.winner(
             make_view(
                 from_addr="noreply@bank.example",
                 subject="Your monthly update is ready",
-                body_text="Your bank statement for account ending 1234 is now available.",
-            ),
-            self.ctx,
+                body_text="Your bank statement for account ending 1234 is available.",
+            )
         )
-        assert result.staged_label == StagedLabel.KEEP
-        assert result.category == "financial_legal_medical"
+        assert winner.name == "financial_legal_medical"
 
-    def test_security_body_protected_despite_innocuous_subject(self):
-        result = engine.evaluate_message(
+    def test_security_body_despite_innocuous_subject(self):
+        winner = self.winner(
             make_view(
-                from_addr="noreply@service.example",
+                from_addr="x@service.example",
                 subject="A note for you",
                 body_text="Your verification code is 558213. Do not share it.",
-            ),
-            self.ctx,
+            )
         )
-        assert result.staged_label == StagedLabel.KEEP
+        assert winner.name == "security_alert"
 
     def test_financial_body_ignores_promo_footer_keywords(self):
-        # A clearance promo whose body only carries bare footer words ("legal",
-        # "insurance", a lone "tax", "benefits") must NOT be protected — the
-        # body match needs an unambiguous multi-word phrase. With no candidate
-        # rule firing either, it falls through to NEEDS_REVIEW (the LLM decides).
-        result = engine.evaluate_message(
+        # Bare footer words ("legal", "insurance", a lone "tax", "benefits")
+        # must not trigger the strict body pattern; nothing else matches either,
+        # so the message goes to the LLM.
+        winner = self.winner(
             make_view(
                 from_addr="deals@wayfair.example",
-                subject="🔴 MEMORIAL DAY CLEARANCE 🔴",
+                subject="MEMORIAL DAY CLEARANCE",
                 body_text=(
                     "Shop our best deals! 0% financing available. See our legal "
                     "terms. Tax-free weekend. Member benefits apply. Insurance "
                     "not included."
                 ),
-            ),
-            self.ctx,
+            )
         )
-        assert result.staged_label == StagedLabel.NEEDS_REVIEW
+        assert winner is None
 
     def test_security_body_ignores_reset_password_cta(self):
-        # The account-management CTA "reset your password" pervades promo
-        # footers; on its own in the body it must not protect a marketing blast.
-        result = engine.evaluate_message(
+        winner = self.winner(
             make_view(
                 from_addr="hello@alphalete.example",
-                subject="A tee you buy twice 🔥",
+                subject="A tee you buy twice",
                 body_text=(
-                    "New drop is live! Manage your account or reset your password "
-                    "any time from your profile."
+                    "New drop is live! Manage your account or reset your "
+                    "password any time from your profile."
                 ),
-            ),
-            self.ctx,
+            )
         )
-        assert result.staged_label == StagedLabel.NEEDS_REVIEW
+        assert winner is None
 
-    def test_security_body_still_protects_password_change_notice(self):
-        # The narrowed body pattern keeps the genuine past-tense notification.
-        result = engine.evaluate_message(
+    def test_security_body_still_matches_password_change_notice(self):
+        winner = self.winner(
             make_view(
-                from_addr="noreply@service.example",
                 subject="A note for you",
                 body_text="Your password was changed on a new device.",
-            ),
-            self.ctx,
+            )
         )
-        assert result.staged_label == StagedLabel.KEEP
+        assert winner.name == "security_alert"
 
-    def test_protection_beats_candidates(self):
-        # A promo from a known contact stays KEEP.
-        result = engine.evaluate_message(
-            make_view(from_addr=FRIEND_ADDR, labels=frozenset({"category promotions"})),
-            self.ctx,
+    def test_known_contact_beats_promo_label(self):
+        winner = self.winner(
+            make_view(from_addr=FRIEND_ADDR, labels=frozenset({"category promotions"}))
         )
-        assert result.staged_label == StagedLabel.KEEP
+        assert winner.name == "known_contact"
 
-    def test_spam_overrides_keyword_protection_but_records_hit(self):
-        # Legal-bait subject on Gmail-flagged spam: staged for deletion, but
-        # the protection hit is kept so the policy gates can never auto-approve.
-        result = engine.evaluate_message(
-            make_view(subject="Final legal notice", labels=frozenset({"spam"})),
-            self.ctx,
-        )
-        assert result.staged_label == StagedLabel.DELETE_CANDIDATE
-        names = {h.rule_name for h in result.hits}
-        assert {"financial_legal_medical", "spam_label"} <= names
+    def test_spam_outranks_keyword_keep_but_keep_hit_recorded(self):
+        # Legal-bait subject on Gmail-flagged spam: spam (300) outranks the
+        # keyword keep (250), but the keep-voting hit stays recorded so the
+        # policy gates can never auto-approve it.
+        view = make_view(subject="Final legal notice", labels=frozenset({"spam"}))
+        assert self.winner(view).name == "spam_label"
+        assert {"financial_legal_medical", "spam_label"} <= self.hit_names(view)
 
-    def test_spam_never_overrides_known_contact(self):
-        result = engine.evaluate_message(
-            make_view(from_addr=FRIEND_ADDR, labels=frozenset({"spam"})), self.ctx
-        )
-        assert result.staged_label == StagedLabel.KEEP
+    def test_spam_never_outranks_known_contact(self):
+        winner = self.winner(make_view(from_addr=FRIEND_ADDR, labels=frozenset({"spam"})))
+        assert winner.name == "known_contact"
 
-    def test_spam_label_is_delete_candidate(self):
-        result = engine.evaluate_message(
-            make_view(labels=frozenset({"spam"})), self.ctx
-        )
-        assert result.staged_label == StagedLabel.DELETE_CANDIDATE
-        assert result.category == "spam"
-        assert any(h.rule_name == "spam_label" for h in result.hits)
+    def test_promo_label_votes_trash(self):
+        winner = self.winner(make_view(labels=frozenset({"category promotions"})))
+        assert winner.name == "promotional_label"
+        assert winner.action == "trash" and winner.confirm_with_llm
 
-    def test_promo_label_is_delete_candidate(self):
-        result = engine.evaluate_message(
-            make_view(labels=frozenset({"category promotions"}), list_unsubscribe=True),
-            self.ctx,
-        )
-        assert result.staged_label == StagedLabel.DELETE_CANDIDATE
-        names = {h.rule_name for h in result.hits}
-        assert {"promotional_label", "newsletter_unsubscribe"} <= names
-
-    def test_receipt_archives_over_delete(self):
-        # Receipt + promo label: most conservative candidate (archive) wins.
-        result = engine.evaluate_message(
+    def test_receipt_outranks_promo_label(self):
+        # Archive rules sit above trash rules: the conservative outcome wins.
+        winner = self.winner(
             make_view(
                 subject="Receipt for your purchase",
                 labels=frozenset({"category promotions"}),
-            ),
-            self.ctx,
+            )
         )
-        assert result.staged_label == StagedLabel.ARCHIVE_CANDIDATE
+        assert winner.name == "receipt" and winner.action == "archive"
 
-    def test_unsubscribe_only_when_nothing_else(self):
-        result = engine.evaluate_message(make_view(list_unsubscribe=True), self.ctx)
-        assert result.staged_label == StagedLabel.UNSUBSCRIBE_CANDIDATE
+    def test_list_unsubscribe_alone_goes_to_llm(self):
+        # newsletter_unsubscribe ships commented out in the template.
+        assert self.winner(make_view(list_unsubscribe=True)) is None
 
-    def test_no_hits_needs_review(self):
-        result = engine.evaluate_message(make_view(), self.ctx)
-        assert result.staged_label == StagedLabel.NEEDS_REVIEW
-        assert result.hits == ()
+    def test_no_hits_goes_to_llm(self):
+        hits = engine.evaluate_message(make_view(), CTX, self.compiled)
+        assert hits == ()
 
-    def test_digest_sender_is_ephemeral_delete(self):
-        # A Reddit-style digest also hits updates_label (Forums -> ARCHIVE), but
-        # the digest override wins: DELETE_CANDIDATE, category 'digest', ephemeral.
-        result = engine.evaluate_message(
+    def test_digest_outranks_updates_label_and_is_ephemeral(self):
+        winner = self.winner(
             make_view(
                 from_addr="noreply@redditmail.com",
                 subject="Top posts from your communities",
                 labels=frozenset({"category forums"}),
                 list_unsubscribe=True,
-            ),
-            self.ctx,
+            )
         )
-        assert result.staged_label == StagedLabel.DELETE_CANDIDATE
-        assert result.category == "digest"
-        assert result.ephemeral is True
-        assert any(h.rule_name == "digest" for h in result.hits)
+        assert winner.name == "digest"
+        assert winner.action == "trash" and winner.ephemeral
 
     def test_digest_subject_backstop(self):
-        # Sender-agnostic: a digest-shaped subject alone triggers it.
-        result = engine.evaluate_message(
-            make_view(from_addr="news@somesite.example", subject="Your daily digest"),
-            self.ctx,
+        winner = self.winner(
+            make_view(from_addr="news@somesite.example", subject="Your daily digest")
         )
-        assert result.staged_label == StagedLabel.DELETE_CANDIDATE
-        assert result.ephemeral is True
+        assert winner.name == "digest"
 
-    def test_digest_never_overrides_protection(self):
-        # A digest from a known contact stays KEEP (protection runs first).
-        result = engine.evaluate_message(
-            make_view(from_addr=FRIEND_ADDR, subject="Your weekly digest"),
-            self.ctx,
+    def test_known_contact_outranks_digest(self):
+        winner = self.winner(
+            make_view(from_addr=FRIEND_ADDR, subject="Your weekly digest")
         )
-        assert result.staged_label == StagedLabel.KEEP
-        assert result.ephemeral is False
+        assert winner.name == "known_contact"
 
-    def test_non_digest_is_not_ephemeral(self):
-        result = engine.evaluate_message(
-            make_view(labels=frozenset({"category promotions"})), self.ctx
-        )
-        assert result.ephemeral is False
+    def test_voice_sms_decides_alone(self):
+        winner = self.winner(make_view(labels=frozenset({"sms"})))
+        assert winner.name == "voice"
+        assert winner.action == "trash" and not winner.confirm_with_llm
 
-    def test_voice_sms_is_delete_candidate_tagged_voice(self):
-        # Google Voice records are staged for trash and tagged 'voice' so the
-        # LLM classifier skips them (CLASSIFIED_BY_VOICE).
-        result = engine.evaluate_message(make_view(labels=frozenset({"sms"})), self.ctx)
-        assert result.staged_label == StagedLabel.DELETE_CANDIDATE
-        assert result.category == "voice_sms"
-        assert result.classified_by == CLASSIFIED_BY_VOICE
-        assert any(h.rule_name == "voice" for h in result.hits)
+    def test_voice_outranks_known_contact(self):
+        # A leaked phone-number contact must not shield Voice records.
+        winner = self.winner(make_view(from_addr=FRIEND_ADDR, labels=frozenset({"sms"})))
+        assert winner.name == "voice"
 
-    def test_voice_call_log_and_voicemail_categories(self):
-        call = engine.evaluate_message(
-            make_view(labels=frozenset({"call log"})), self.ctx
-        )
-        assert call.staged_label == StagedLabel.DELETE_CANDIDATE
-        assert call.category == "voice_call"
-
-        vm = engine.evaluate_message(
-            make_view(labels=frozenset({"voicemail"})), self.ctx
-        )
-        assert vm.category == "voice_voicemail"
-
-    def test_voice_beats_other_candidates(self):
-        # An SMS that also carries an archive-class label still trashes as voice
-        # (the override wins over the most-conservative precedence).
-        result = engine.evaluate_message(
-            make_view(labels=frozenset({"sms", "category updates"})), self.ctx
-        )
-        assert result.staged_label == StagedLabel.DELETE_CANDIDATE
-        assert result.category == "voice_sms"
-        assert result.classified_by == CLASSIFIED_BY_VOICE
-
-    def test_voice_overrides_protection(self):
-        # A Voice record is decided before protection: even when the (synthetic
-        # `unknown.email`) number leaked into the contacts, it still trashes as
-        # voice rather than being shielded as a known contact.
-        result = engine.evaluate_message(
-            make_view(from_addr=FRIEND_ADDR, labels=frozenset({"sms"})), self.ctx
-        )
-        assert result.staged_label == StagedLabel.DELETE_CANDIDATE
-        assert result.category == "voice_sms"
-        assert result.classified_by == CLASSIFIED_BY_VOICE
-        # The shielding known_contact protection is not even recorded.
-        assert not any(h.rule_name == "known_contact" for h in result.hits)
+    def test_voice_outranks_other_labels(self):
+        winner = self.winner(make_view(labels=frozenset({"sms", "category updates"})))
+        assert winner.name == "voice"
 
 
-def test_select_candidate_is_priority_then_precedence():
-    """Candidate selection is data-driven: highest priority wins, ties broken by
-    the conservative precedence — no rule is matched by name."""
-    from local_llm_email_cleaner.models import RuleKind, RuleVote
-
-    def vote(name, label, priority=0):
-        return RuleVote(name, RuleKind.CANDIDATE, label, name, priority=priority)
-
-    # Higher priority wins outright, even over a more-conservative label.
-    winner = engine._select_candidate(
-        (
-            vote("arch", StagedLabel.ARCHIVE_CANDIDATE),
-            vote("hi", StagedLabel.DELETE_CANDIDATE, priority=5),
-        )
-    )
-    assert winner.rule_name == "hi"
-
-    # Equal priority -> most conservative staged_label (ARCHIVE > DELETE).
-    winner = engine._select_candidate(
-        (
-            vote("d", StagedLabel.DELETE_CANDIDATE),
-            vote("a", StagedLabel.ARCHIVE_CANDIDATE),
-        )
-    )
-    assert winner.staged_label == StagedLabel.ARCHIVE_CANDIDATE
+# --- run_rules persistence -----------------------------------------------------
 
 
-def test_disposition_comes_from_vote_fields_not_rule_name():
-    """ephemeral / skip_llm on the winning vote drive the result; the engine
-    never inspects rule_name."""
-    result = engine.evaluate_message(
-        make_view(from_addr="noreply@redditmail.com", subject="Top posts"), self_ctx()
-    )
-    assert result.ephemeral is True  # from the digest vote's field
-    voice = engine.evaluate_message(make_view(labels=frozenset({"sms"})), self_ctx())
-    assert voice.classified_by == CLASSIFIED_BY_VOICE  # from the voice vote's skip_llm
-
-
-def self_ctx() -> RuleContext:
-    return RuleContext(known_contacts=frozenset({FRIEND_ADDR}))
-
-
-def test_rule_categories_are_canonical():
-    """Every category a rule can vote must be in models.CATEGORIES (lockstep
-    with the LLM's constrained category enum)."""
-    from local_llm_email_cleaner.models import CATEGORIES
-    from local_llm_email_cleaner.rules import candidate_rules as cr
-    from local_llm_email_cleaner.rules import protection_rules as pr
-
-    def view(**overrides) -> MessageView:
-        return make_view(**overrides)
-
-    ctx = RuleContext(known_contacts=frozenset({FRIEND_ADDR}))
-    # Each entry: a rule fired against an input that makes it vote.
-    votes = [
-        cr.receipt(view(subject="your receipt"), ctx),
-        cr.updates_label(view(labels=frozenset({"category updates"})), ctx),
-        cr.digest(view(from_addr="noreply@redditmail.com"), ctx),
-        cr.shipping(view(subject="has shipped"), ctx),
-        cr.calendar(view(subject="Invitation: party"), ctx),
-        cr.spam_label(view(labels=frozenset({"spam"})), ctx),
-        cr.promotional_label(view(labels=frozenset({"promotions"})), ctx),
-        cr.social_label(view(labels=frozenset({"social"})), ctx),
-        cr.noreply_sender(view(from_addr="noreply@x.example"), ctx),
-        cr.newsletter_unsubscribe(view(list_unsubscribe=True), ctx),
-        pr.known_contact(view(from_addr=FRIEND_ADDR), ctx),
-        pr.financial_legal_medical(view(subject="tax documents"), ctx),
-        pr.security_alert(view(subject="security alert: new sign-in"), ctx),
-    ]
-    seen = set()
-    for vote in votes:
-        assert vote is not None
-        seen.add(vote.category)
-    assert seen <= set(CATEGORIES), seen - set(CATEGORIES)
-
-
-def test_every_rule_has_a_rationale():
-    """RULE_RATIONALE must cover exactly the live rules — no missing entry (a new
-    rule shipped without a rationale) and no stale one (a removed rule)."""
-    from local_llm_email_cleaner.rules.candidate_rules import CANDIDATE_RULES
-    from local_llm_email_cleaner.rules.protection_rules import PROTECTION_RULES
-    from local_llm_email_cleaner.rules.rationale import RULE_RATIONALE
-
-    rule_names = {fn.__name__ for fn in PROTECTION_RULES + CANDIDATE_RULES}
-    assert set(RULE_RATIONALE) == rule_names
-
-
-def test_run_rules_end_to_end(conn, mbox_path, cfg):
+def test_run_rules_end_to_end(conn, mbox_path, cfg, default_ruleset):
     store.ingest_mbox(conn, mbox_path)
     contacts.derive_contacts(conn, cfg.user_addresses)
     ctx = engine.load_context(conn)
 
-    counts = engine.run_rules(conn, ctx)
+    counts = engine.run_rules(conn, default_ruleset, ctx)
     assert sum(counts.values()) == 7
+    # Only the known-contact keep decides alone; every matched candidate wants
+    # LLM confirmation and the unmatched rows go to the LLM outright.
+    assert counts["keep"] == 1
+    assert counts["needs_llm"] == 6
 
-    def staged(message_id_suffix: str) -> str:
+    def row(message_id: str):
         return conn.execute(
-            "SELECT staged_label FROM messages WHERE rfc_message_id=?",
-            (message_id_suffix,),
-        ).fetchone()[0]
+            "SELECT rule_name, rule_action, rule_protected, action, decision_source "
+            "FROM messages WHERE rfc_message_id=?",
+            (message_id,),
+        ).fetchone()
 
-    assert staged("friend-1@example.com") == "KEEP"  # known contact
-    assert staged("bank-1@example.com") == "KEEP"  # financial keywords
-    # Promos trash regardless of age (promotional_label -> DELETE_CANDIDATE).
-    assert staged("promo-1@example.com") == "DELETE_CANDIDATE"
-    assert staged("promo-2@example.com") == "DELETE_CANDIDATE"
-    assert staged("ship-1@example.com") == "DELETE_CANDIDATE"
-    assert staged("photos-1@example.com") == "NEEDS_REVIEW"
+    friend = row("friend-1@example.com")
+    assert friend["rule_name"] == "known_contact"
+    assert friend["action"] == "keep" and friend["decision_source"] == "rule"
+    assert friend["rule_protected"] == 1
 
-    # rule_hits recorded with kinds
+    bank = row("bank-1@example.com")  # keyword keep, awaiting LLM confirmation
+    assert bank["rule_name"] == "financial_legal_medical"
+    assert bank["rule_action"] == "keep" and bank["action"] is None
+
+    promo = row("promo-1@example.com")
+    assert promo["rule_name"] == "promotional_label"
+    assert promo["rule_action"] == "trash" and promo["action"] is None
+
+    ship = row("ship-1@example.com")  # shipping outranks noreply by file order
+    assert ship["rule_name"] == "shipping"
+
+    photos = row("photos-1@example.com")  # no rule matched -> LLM
+    assert photos["rule_name"] is None and photos["action"] is None
+
+    # All matches recorded; the winner flagged.
     hits = conn.execute(
         """
-        SELECT rule_name, rule_kind FROM rule_hits
+        SELECT rule_hits.rule_name, won FROM rule_hits
         JOIN messages ON messages.id = rule_hits.message_id
         WHERE messages.rfc_message_id = 'ship-1@example.com'
         """
     ).fetchall()
-    names = {(h["rule_name"], h["rule_kind"]) for h in hits}
-    assert ("shipping", "candidate") in names
-    assert ("noreply_sender", "candidate") in names
+    assert {(h["rule_name"], h["won"]) for h in hits} == {
+        ("shipping", 1),
+        ("noreply_sender", 0),
+    }
 
     # Second run is a no-op (only un-ruled rows are evaluated).
-    assert sum(engine.run_rules(conn, ctx).values()) == 0
+    assert sum(engine.run_rules(conn, default_ruleset, ctx).values()) == 0
 
 
-def test_run_rules_stages_voice_messages(conn):
-    from conftest import insert_message
-
+def test_run_rules_decides_voice_alone(conn, default_ruleset):
     mid = insert_message(
         conn,
         from_addr="+12164969651@unknown.email",
         subject="SMS with Michael",
         labels="SMS",
     )
-    engine.run_rules(conn, RuleContext())
+    engine.run_rules(conn, default_ruleset, RuleContext())
 
     row = conn.execute(
-        "SELECT staged_label, proposed_action, ai_category, classified_by "
+        "SELECT rule_name, rule_action, action, decision_source, llm_action "
         "FROM messages WHERE id=?",
         (mid,),
     ).fetchone()
-    assert row["staged_label"] == "DELETE_CANDIDATE"
-    assert row["proposed_action"] == "trash"
-    assert row["ai_category"] == "voice_sms"
-    assert row["classified_by"] == CLASSIFIED_BY_VOICE  # so the LLM skips it
-
-    hit = conn.execute(
-        "SELECT rule_kind, outcome FROM rule_hits WHERE message_id=? AND rule_name='voice'",
-        (mid,),
-    ).fetchone()
-    assert hit["rule_kind"] == "candidate"
-    assert hit["outcome"] == "DELETE_CANDIDATE"
+    assert row["rule_name"] == "voice"
+    assert row["action"] == "trash" and row["decision_source"] == "rule"
+    assert row["llm_action"] is None  # never sent to the LLM
 
 
-def test_reset_preserves_non_pending_rule_hits(conn, mbox_path):
+def test_reset_preserves_non_pending_rule_hits(conn, mbox_path, default_ruleset):
     """rules --reset must not orphan approved/applied rows from their hits."""
     store.ingest_mbox(conn, mbox_path)
     ctx = engine.load_context(conn)
-    engine.run_rules(conn, ctx)
+    engine.run_rules(conn, default_ruleset, ctx)
 
     approved_id = conn.execute(
         "SELECT id FROM messages WHERE rfc_message_id='ship-1@example.com'"
@@ -444,26 +299,94 @@ def test_reset_preserves_non_pending_rule_hits(conn, mbox_path):
     ).fetchone()[0]
     assert hits(pending_id) > 0
 
-    engine.run_rules(conn, ctx, reset=True)
+    engine.run_rules(conn, default_ruleset, ctx, reset=True)
 
-    # Approved row keeps its hits and its staging; pending row was recomputed.
     assert hits(approved_id) > 0
     assert hits(pending_id) > 0
     assert (
         conn.execute(
-            "SELECT staged_label FROM messages WHERE id=?", (approved_id,)
+            "SELECT rule_name FROM messages WHERE id=?", (approved_id,)
         ).fetchone()[0]
         is not None
     )
 
 
-def test_run_rules_commits_per_chunk(conn, mbox_path, monkeypatch):
+def test_reset_preserves_llm_verdicts_and_refinalizes(conn, tmp_path, default_ruleset):
+    """Tuning rules.toml + re-running never re-pays LLM time: stored verdicts
+    are kept and the final action is re-derived from them."""
+    mid = insert_message(
+        conn, from_addr="deals@shop.example", labels="Category Promotions"
+    )
+    ctx = RuleContext()
+    engine.run_rules(conn, default_ruleset, ctx)
+    # Simulate the classifier having confirmed the promo as trash.
+    conn.execute(
+        "UPDATE messages SET llm_action='trash', llm_category='promotion', "
+        "llm_confidence=0.97, llm_reason='obvious promo', action='trash', "
+        "decision_source='rule+llm' WHERE id=?",
+        (mid,),
+    )
+    conn.commit()
+
+    # Re-run after a "tuning pass" (same rules here): the row re-finalizes from
+    # the stored verdict without going back to the LLM.
+    engine.run_rules(conn, default_ruleset, ctx, reset=True)
+    row = conn.execute(
+        "SELECT action, decision_source, llm_confidence FROM messages WHERE id=?",
+        (mid,),
+    ).fetchone()
+    assert row["action"] == "trash" and row["decision_source"] == "rule+llm"
+    assert row["llm_confidence"] == 0.97
+
+    # A tuning pass that flips the rule to archive now DISAGREES with the
+    # stored trash verdict -> review, still no LLM re-run.
+    flipped = make_ruleset(
+        tmp_path,
+        """
+        [[rules]]
+        name = "promos_archive_now"
+        action = "archive"
+        confirm_with_llm = true
+        [[rules.match]]
+        gmail_labels = ["category promotions"]
+        """,
+    )
+    engine.run_rules(conn, flipped, ctx, reset=True)
+    row = conn.execute(
+        "SELECT rule_action, action, decision_source FROM messages WHERE id=?", (mid,)
+    ).fetchone()
+    assert row["rule_action"] == "archive"
+    assert row["action"] == "review" and row["decision_source"] == "rule+llm"
+
+    # --reset --full wipes the verdicts too: back to awaiting the LLM.
+    engine.run_rules(conn, flipped, ctx, reset=True, full=True)
+    row = conn.execute(
+        "SELECT llm_action, action FROM messages WHERE id=?", (mid,)
+    ).fetchone()
+    assert row["llm_action"] is None and row["action"] is None
+
+
+def test_finalize_with_stored_llm_no_rule_uses_llm_action(conn):
+    mid = insert_message(
+        conn,
+        ruled_at="2026-01-01T00:00:00",
+        llm_action="archive",
+        llm_confidence=0.8,
+    )
+    assert engine.finalize_with_stored_llm(conn) == 1
+    row = conn.execute(
+        "SELECT action, decision_source FROM messages WHERE id=?", (mid,)
+    ).fetchone()
+    assert row["action"] == "archive" and row["decision_source"] == "llm"
+
+
+def test_run_rules_commits_per_chunk(conn, mbox_path, monkeypatch, default_ruleset):
     store.ingest_mbox(conn, mbox_path)
     ctx = engine.load_context(conn)
     monkeypatch.setattr(engine, "BATCH_SIZE", 2)
-    counts = engine.run_rules(conn, ctx)
+    counts = engine.run_rules(conn, default_ruleset, ctx)
     assert sum(counts.values()) == 7
-    staged_rows = conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE staged_label IS NOT NULL"
+    ruled_rows = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE ruled_at IS NOT NULL"
     ).fetchone()[0]
-    assert staged_rows == 7
+    assert ruled_rows == 7

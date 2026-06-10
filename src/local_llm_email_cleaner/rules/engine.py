@@ -1,23 +1,20 @@
 """Rule evaluation and persistence.
 
-Semantics:
-0. Synthetic records (a candidate vote carrying skip_llm — Google Voice
-   SMS/call/voicemail) are decided before everything else. They are converter
-   artifacts addressed `<number>@unknown.email`, not real correspondence, and
-   the outbound-SMS copy can leak that number into the derived contacts — so
-   the known-contact protection would otherwise force KEEP and shield them from
-   cleanup. skip_llm is the only signal used here; no rule is matched by name.
-1. Protection rules run next — a hit forces KEEP and excludes the message
-   from LLM classification and the policy gates. Exception: Gmail's own Spam
-   label overrides the keyword protections (scam bait imitates exactly those
-   subjects) but never known_contact; overridden hits are still recorded, so
-   the gates refuse to auto-approve such messages — human review only.
-2. Candidate rules vote cleanup classes; the winning vote is the one with the
-   highest RuleVote.priority, ties broken by the most conservative staged_label
-   (ARCHIVE > DELETE > UNSUBSCRIBE). Every hit is recorded in rule_hits. The
-   winner's own fields (ephemeral, skip_llm) drive the disposition — the engine
-   does not special-case any rule by name.
-3. No hits at all -> NEEDS_REVIEW, left for the LLM classifier.
+Semantics (all data-driven from rules.toml — the engine special-cases nothing
+by name):
+
+1. Every enabled rule is tested against every message; ALL matches are
+   recorded in rule_hits (the policy gates refuse to auto-approve a message
+   with any keep-voting hit, winner or not).
+2. The winner is the highest-priority match, ties broken by file order
+   (compile_ruleset already yields rules in that order, so the first match
+   wins).
+3. A winner with protect, or with confirm_with_llm = false, decides alone:
+   action is finalized with decision_source='rule'. A winner that wants LLM
+   confirmation writes only its rule_* verdict and leaves action NULL.
+4. No match at all -> only ruled_at is set; the LLM suggests the action.
+
+"Awaiting LLM" is therefore `action IS NULL AND ruled_at IS NOT NULL`.
 """
 
 from __future__ import annotations
@@ -25,119 +22,62 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections import Counter
-from dataclasses import dataclass
 
-from ..models import (
-    ACTION_FOR_LABEL,
-    CLASSIFIED_BY_RULES,
-    CLASSIFIED_BY_VOICE,
-    RuleVote,
-    StagedLabel,
-)
-from . import patterns
-from .candidate_rules import CANDIDATE_RULES
-from .protection_rules import ABSOLUTE_PROTECTION_RULES, OVERRIDABLE_PROTECTION_RULES
+from ..models import DecisionSource, finalize
+from .matcher import CompiledRule, compile_ruleset
+from .ruleset import RuleSet
 from .views import MessageView, RuleContext
 
 logger = logging.getLogger(__name__)
-
-# Most conservative outcome first; breaks ties among equal-priority votes.
-_CANDIDATE_PRECEDENCE = (
-    StagedLabel.ARCHIVE_CANDIDATE,
-    StagedLabel.DELETE_CANDIDATE,
-    StagedLabel.UNSUBSCRIBE_CANDIDATE,
-)
-
-
-def _select_candidate(votes: tuple[RuleVote, ...]) -> RuleVote:
-    """Pick the winning candidate vote: highest priority, then most conservative
-    staged_label. The choice is data-driven — no rule is matched by name."""
-    top = max(v.priority for v in votes)
-    contenders = [v for v in votes if v.priority == top]
-    if len(contenders) == 1:
-        return contenders[0]
-    by_label = {v.staged_label: v for v in reversed(contenders)}  # keep first seen
-    for label in _CANDIDATE_PRECEDENCE:
-        if label in by_label:
-            return by_label[label]
-    return contenders[0]
-
-
-@dataclass(frozen=True)
-class RuleResult:
-    staged_label: StagedLabel
-    category: str | None
-    hits: tuple[RuleVote, ...]
-    ephemeral: bool = False
-    #: overrides the engine's default classified_by ('rules') for this row —
-    #: voice messages use 'voice' so the LLM classifier skips them.
-    classified_by: str | None = None
-
-
-def evaluate_message(msg: MessageView, ctx: RuleContext) -> RuleResult:
-    candidate_hits = tuple(v for rule in CANDIDATE_RULES if (v := rule(msg, ctx)))
-
-    # Synthetic records (skip_llm — Google Voice) are decided before protection:
-    # they are converter artifacts, not correspondence, and a leaked phone number
-    # in the contacts must not let known_contact shield them from cleanup. They
-    # are tagged CLASSIFIED_BY_VOICE so the classifier skips them and the auto-
-    # trash gate never fires (skip_llm => ai_confidence stays NULL => review).
-    synthetic_hits = tuple(v for v in candidate_hits if v.skip_llm)
-    if synthetic_hits:
-        winner = _select_candidate(synthetic_hits)
-        return RuleResult(
-            winner.staged_label,
-            winner.category,
-            candidate_hits,
-            ephemeral=winner.ephemeral,
-            classified_by=CLASSIFIED_BY_VOICE,
-        )
-
-    absolute_hits = tuple(
-        v for rule in ABSOLUTE_PROTECTION_RULES if (v := rule(msg, ctx))
-    )
-    keyword_hits = tuple(
-        v for rule in OVERRIDABLE_PROTECTION_RULES if (v := rule(msg, ctx))
-    )
-    spam = bool(msg.labels & patterns.SPAM_LABELS)
-    if absolute_hits or (keyword_hits and not spam):
-        hits = absolute_hits + keyword_hits
-        return RuleResult(StagedLabel.KEEP, hits[0].category, hits)
-
-    # Spam override: keyword protection hits are still recorded below, so the
-    # policy gates can never auto-approve these — they always reach a human.
-    #
-    # The winning vote's own fields drive the disposition — no rule is matched by
-    # name. An ephemeral vote (digest) lets the gate waive the age floor once the
-    # LLM also confirms; priority lets a vote beat the ordinary ARCHIVE > DELETE >
-    # UNSUBSCRIBE precedence. (skip_llm votes were already handled above.)
-    if candidate_hits:
-        winner = _select_candidate(candidate_hits)
-        return RuleResult(
-            winner.staged_label,
-            winner.category,
-            keyword_hits + candidate_hits,
-            ephemeral=winner.ephemeral,
-        )
-
-    return RuleResult(StagedLabel.NEEDS_REVIEW, None, keyword_hits + candidate_hits)
-
 
 BATCH_SIZE = 500
 
 _UPDATE_SQL = """
 UPDATE messages
-SET staged_label=?, proposed_action=?, ai_category=?, classified_by=?, ephemeral=?
+SET ruled_at=datetime('now'), rule_name=?, rule_action=?, rule_category=?,
+    rule_protected=?, rule_ephemeral=?, action=?, decision_source=?
 WHERE id=?
 """
 
-_INSERT_HIT_SQL = "INSERT INTO rule_hits (message_id, rule_name, rule_kind, outcome) VALUES (?, ?, ?, ?)"
+_INSERT_HIT_SQL = (
+    "INSERT INTO rule_hits (message_id, rule_name, action, won) VALUES (?, ?, ?, ?)"
+)
+
+#: decision columns owned by the rules stage, reset together
+_RESET_RULE_COLS = """
+ruled_at=NULL, rule_name=NULL, rule_action=NULL, rule_category=NULL,
+rule_protected=0, rule_ephemeral=0, action=NULL, decision_source=NULL
+"""
+
+_RESET_LLM_COLS = """
+llm_action=NULL, llm_category=NULL, llm_confidence=NULL, llm_reason=NULL,
+llm_ephemeral=0
+"""
+
+
+def evaluate_message(
+    msg: MessageView, ctx: RuleContext, compiled: tuple[CompiledRule, ...]
+) -> tuple[CompiledRule, ...]:
+    """All rules matching this message, in evaluation (= winning) order."""
+    return tuple(rule for rule in compiled if rule.matches(msg, ctx))
 
 
 def run_rules(
-    conn: sqlite3.Connection, ctx: RuleContext, reset: bool = False
+    conn: sqlite3.Connection,
+    ruleset: RuleSet,
+    ctx: RuleContext,
+    reset: bool = False,
+    full: bool = False,
 ) -> Counter:
-    """Evaluate all un-ruled messages; returns counts per staged label.
+    """Evaluate all un-ruled messages; returns counts per outcome.
+
+    Counter keys: the winner's action for rule-decided rows, "needs_llm" for
+    rows handed to the classifier (rule pending confirmation or no match).
+
+    reset re-evaluates every still-pending row (approved/applied rows keep
+    their provenance) but PRESERVES stored LLM verdicts, re-finalizing from
+    them afterwards — tuning rules.toml never re-pays LLM time. full=True
+    wipes the LLM verdicts too.
 
     Writes are flushed per BATCH_SIZE chunk (interrupt-safe, like ingest).
     """
@@ -151,19 +91,18 @@ def run_rules(
                 (SELECT id FROM messages WHERE review_status = 'pending')
             """
         )
+        reset_cols = _RESET_RULE_COLS + (", " + _RESET_LLM_COLS if full else "")
         conn.execute(
-            """
-            UPDATE messages SET staged_label=NULL, proposed_action=NULL, ai_category=NULL,
-                   ai_confidence=NULL, ai_reason=NULL, classified_by=NULL, ephemeral=0
-            WHERE review_status = 'pending'
-            """
+            f"UPDATE messages SET {reset_cols} WHERE review_status = 'pending'"
         )
         conn.commit()
 
-    # Stream the corpus one BATCH_SIZE chunk at a time. Every evaluated row gets
-    # a non-NULL staged_label and is committed before the next fetch, so it
-    # drops out of `staged_label IS NULL` — memory stays bounded to one chunk
-    # even though we now pull body_text (which protection rules scan).
+    compiled = compile_ruleset(ruleset)
+
+    # Stream the corpus one BATCH_SIZE chunk at a time. Every evaluated row
+    # gets a non-NULL ruled_at and is committed before the next fetch, so it
+    # drops out of `ruled_at IS NULL` — memory stays bounded to one chunk even
+    # though we pull body_text (which keep-keyword rules scan).
     counts: Counter = Counter()
     total = 0
 
@@ -172,7 +111,7 @@ def run_rules(
             """
             SELECT id, from_addr, from_name, subject, labels, has_attachments,
                    list_unsubscribe, body_text
-            FROM messages WHERE staged_label IS NULL
+            FROM messages WHERE ruled_at IS NULL
             ORDER BY id LIMIT ?
             """,
             (BATCH_SIZE,),
@@ -184,27 +123,35 @@ def run_rules(
         hit_batch: list[tuple] = []
         for row in rows:
             view = MessageView.from_row(row)
-            result = evaluate_message(view, ctx)
-            counts[result.staged_label.value] += 1
+            hits = evaluate_message(view, ctx, compiled)
+            winner = hits[0].rule if hits else None
 
-            classified_by = result.classified_by or (
-                CLASSIFIED_BY_RULES
-                if result.staged_label != StagedLabel.NEEDS_REVIEW
-                else None
-            )
-            update_batch.append(
-                (
-                    result.staged_label.value,
-                    ACTION_FOR_LABEL[result.staged_label].value,
-                    result.category,
-                    classified_by,
-                    int(result.ephemeral),
-                    view.id,
+            if winner is None:
+                counts["needs_llm"] += 1
+                update_batch.append((None, None, None, 0, 0, None, None, view.id))
+            else:
+                decides_alone = winner.protect or not winner.confirm_with_llm
+                if decides_alone:
+                    counts[winner.action] += 1
+                    action, source = winner.action, DecisionSource.RULE.value
+                else:
+                    counts["needs_llm"] += 1
+                    action = source = None
+                update_batch.append(
+                    (
+                        winner.name,
+                        winner.action,
+                        winner.category,
+                        int(winner.protect),
+                        int(winner.ephemeral),
+                        action,
+                        source,
+                        view.id,
+                    )
                 )
-            )
             hit_batch.extend(
-                (view.id, hit.rule_name, hit.rule_kind.value, hit.staged_label.value)
-                for hit in result.hits
+                (view.id, hit.name, hit.rule.action, int(hit is hits[0]))
+                for hit in hits
             )
 
         conn.executemany(_UPDATE_SQL, update_batch)
@@ -212,8 +159,37 @@ def run_rules(
         conn.commit()
         total += len(rows)
 
+    merged = finalize_with_stored_llm(conn)
+    if merged:
+        logger.info("Re-finalized %d rows from stored LLM verdicts", merged)
+
     logger.info("Rules evaluated %d messages: %s", total, dict(counts))
     return counts
+
+
+def finalize_with_stored_llm(conn: sqlite3.Connection) -> int:
+    """Finalize rows that already carry an LLM verdict (after a rules re-run).
+
+    Uses the same agree/disagree logic as the classifier (models.finalize), so
+    a rules.toml tuning pass only sends genuinely new rows back to the LLM.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, rule_action, llm_action FROM messages
+        WHERE action IS NULL AND ruled_at IS NOT NULL AND llm_action IS NOT NULL
+        """
+    ).fetchall()
+    if not rows:
+        return 0
+    updates = []
+    for row in rows:
+        action, source = finalize(row["rule_action"], row["llm_action"])
+        updates.append((action, source, row["id"]))
+    conn.executemany(
+        "UPDATE messages SET action=?, decision_source=? WHERE id=?", updates
+    )
+    conn.commit()
+    return len(rows)
 
 
 def load_context(conn: sqlite3.Connection) -> RuleContext:

@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 import tomllib
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 from typing import Literal
 
@@ -184,6 +185,16 @@ def _rule_label(raw: dict, loc: tuple) -> tuple[str | None, str]:
         else:
             field = f"{field}.{part}" if field else str(part)
     return name, field
+
+
+def write_default_rules(path: Path) -> None:
+    """Materialize the packaged starter rules.toml (used by `init`)."""
+    template = (
+        resources.files("local_llm_email_cleaner")
+        .joinpath("rules/default_rules.toml")
+        .read_text(encoding="utf-8")
+    )
+    path.write_text(template, encoding="utf-8")
 
 
 def load_ruleset(path: Path) -> RuleSet:

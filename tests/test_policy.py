@@ -1,4 +1,5 @@
-"""Policy gate: auto-approval requires EVERY condition; re-runnable."""
+"""Policy gates: auto-approval requires EVERY condition; re-runnable;
+preview == apply."""
 
 from __future__ import annotations
 
@@ -9,19 +10,29 @@ from conftest import FRIEND_ADDR, RECENT_DATE, add_rule_hit, insert_message
 
 from local_llm_email_cleaner import policy
 
+RULED = "2026-01-01T00:00:00"
+
+
+def params(cfg, **overrides) -> policy.PolicyParams:
+    return dataclasses.replace(policy.PolicyParams.from_config(cfg), **overrides)
+
 
 def eligible_row(conn, **overrides) -> int:
-    """A row that passes the whole gate unless an override breaks a condition."""
+    """A row that passes the whole trash gate unless an override breaks it:
+    rule-staged trash, confirmed by the LLM, old, clean, unknown sender."""
     fields = dict(
-        staged_label="DELETE_CANDIDATE",
-        proposed_action="trash",
-        classified_by="rules+llm",
-        ai_confidence=0.95,
+        ruled_at=RULED,
+        rule_name="promotional_label",
+        rule_action="trash",
+        llm_action="trash",
+        llm_confidence=0.95,
+        action="trash",
+        decision_source="rule+llm",
         has_attachments=0,
     )
     fields.update(overrides)
     msg_id = insert_message(conn, **fields)
-    add_rule_hit(conn, msg_id, "candidate", "promotional_label")
+    add_rule_hit(conn, msg_id, "trash", "promotional_label", won=True)
     return msg_id
 
 
@@ -31,22 +42,25 @@ def status_of(conn, msg_id: int) -> str:
     ).fetchone()[0]
 
 
+# --- trash gate ------------------------------------------------------------------
+
+
 def test_gate_approves_when_all_conditions_hold(conn, cfg):
     msg_id = eligible_row(conn)
-    result = policy.apply_policy(conn, cfg)
+    result = policy.apply_policy(conn, params(cfg))
     assert result["auto_approved"] == 1
     assert status_of(conn, msg_id) == "auto_approved"
 
 
 def test_gate_rejects_low_confidence(conn, cfg):
-    msg_id = eligible_row(conn, ai_confidence=0.85)
-    policy.apply_policy(conn, cfg)
+    msg_id = eligible_row(conn, llm_confidence=0.85)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
 def test_gate_rejects_attachments(conn, cfg):
     msg_id = eligible_row(conn, has_attachments=1)
-    policy.apply_policy(conn, cfg)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
@@ -56,7 +70,7 @@ def test_gate_rejects_recent_messages(conn, cfg):
         date_utc=RECENT_DATE.isoformat(),
         date_epoch=int(RECENT_DATE.timestamp()),
     )
-    policy.apply_policy(conn, cfg)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
@@ -66,143 +80,199 @@ def test_gate_rejects_known_contacts(conn, cfg):
         (FRIEND_ADDR,),
     )
     msg_id = eligible_row(conn, from_addr=FRIEND_ADDR)
-    policy.apply_policy(conn, cfg)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
-def test_gate_requires_candidate_rule_hit(conn, cfg):
+def test_gate_requires_rule_staged_trash(conn, cfg):
     # LLM said trash, but no deterministic rule ever matched.
     msg_id = insert_message(
         conn,
-        staged_label="DELETE_CANDIDATE",
-        proposed_action="trash",
-        classified_by="llm",
-        ai_confidence=0.99,
+        ruled_at=RULED,
+        llm_action="trash",
+        llm_confidence=0.99,
+        action="trash",
+        decision_source="llm",
     )
-    policy.apply_policy(conn, cfg)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
-def test_gate_rejects_protected_messages(conn, cfg):
-    msg_id = eligible_row(conn)
-    add_rule_hit(conn, msg_id, "protection", "financial_legal_medical")
-    policy.apply_policy(conn, cfg)
+def test_gate_rejects_protect_won_rows(conn, cfg):
+    msg_id = eligible_row(conn, rule_protected=1)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
-def test_spam_overridden_protection_is_review_only(conn, cfg):
-    # Spam-label staging records the suppressed keyword-protection hit, which
+def test_any_keep_voting_hit_blocks_auto_approval(conn, cfg):
+    # The spam label outranked a keyword keep: the keep hit stays recorded and
     # must keep the message out of auto-approval no matter how confident the
     # LLM is — human review only.
-    msg_id = eligible_row(conn, ai_confidence=0.99)
-    add_rule_hit(conn, msg_id, "candidate", "spam_label")
-    add_rule_hit(conn, msg_id, "protection", "financial_legal_medical")
-    policy.apply_policy(conn, cfg)
+    msg_id = eligible_row(conn, llm_confidence=0.99, rule_name="spam_label")
+    add_rule_hit(conn, msg_id, "keep", "financial_legal_medical")
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
-def test_gate_requires_llm_confidence(conn, cfg):
-    # Rules-only rows (no LLM verdict) are never auto-approved.
-    msg_id = eligible_row(conn, classified_by="rules", ai_confidence=None)
-    policy.apply_policy(conn, cfg)
+def test_gate_requires_llm_confidence_by_default(conn, cfg):
+    # A rule that decided alone (decision_source='rule', no LLM verdict) is
+    # never auto-approved unless allow_rule_only is opted into.
+    msg_id = eligible_row(
+        conn, llm_action=None, llm_confidence=None, decision_source="rule"
+    )
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
-def test_ephemeral_recent_auto_trashes(conn, cfg):
-    # Recent (well past the 7-day grace, but far short of the 12-month floor),
-    # yet ephemeral: the age floor is waived, so it auto-trashes.
+def test_allow_rule_only_opts_rule_decided_trash_in(conn, cfg):
+    msg_id = eligible_row(
+        conn, llm_action=None, llm_confidence=None, decision_source="rule"
+    )
+    policy.apply_policy(conn, params(cfg, auto_trash_allow_rule_only=True))
+    assert status_of(conn, msg_id) == "auto_approved"
+
+
+def test_allow_rule_only_still_enforces_other_guards(conn, cfg):
+    # The opt-in waives only the confidence requirement — age still applies.
     msg_id = eligible_row(
         conn,
-        ephemeral=1,
+        llm_action=None,
+        llm_confidence=None,
+        decision_source="rule",
         date_utc=RECENT_DATE.isoformat(),
         date_epoch=int(RECENT_DATE.timestamp()),
     )
-    policy.apply_policy(conn, cfg)
+    policy.apply_policy(conn, params(cfg, auto_trash_allow_rule_only=True))
+    assert status_of(conn, msg_id) == "pending"
+
+
+# --- ephemeral age-floor waiver ----------------------------------------------------
+
+
+def test_ephemeral_recent_auto_trashes_when_both_agree(conn, cfg):
+    # Recent (past the 7-day grace, far short of the 12-month floor), and BOTH
+    # the rule and the LLM flagged it ephemeral: the age floor is waived.
+    msg_id = eligible_row(
+        conn,
+        rule_ephemeral=1,
+        llm_ephemeral=1,
+        date_utc=RECENT_DATE.isoformat(),
+        date_epoch=int(RECENT_DATE.timestamp()),
+    )
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "auto_approved"
+
+
+def test_ephemeral_needs_both_flags(conn, cfg):
+    rule_only = eligible_row(
+        conn,
+        rule_ephemeral=1,
+        llm_ephemeral=0,
+        date_utc=RECENT_DATE.isoformat(),
+        date_epoch=int(RECENT_DATE.timestamp()),
+    )
+    llm_only = eligible_row(
+        conn,
+        rule_ephemeral=0,
+        llm_ephemeral=1,
+        date_utc=RECENT_DATE.isoformat(),
+        date_epoch=int(RECENT_DATE.timestamp()),
+        rfc_message_id="llmonly@x",
+    )
+    policy.apply_policy(conn, params(cfg))
+    assert status_of(conn, rule_only) == "pending"
+    assert status_of(conn, llm_only) == "pending"
 
 
 def test_ephemeral_within_grace_not_trashed(conn, cfg):
     # Inside the short grace window: even an ephemeral digest waits for review.
-    just_now = datetime.now(UTC) - timedelta(
-        days=2
-    )  # < auto_trash_ephemeral_min_age_days
+    just_now = datetime.now(UTC) - timedelta(days=2)
     msg_id = eligible_row(
         conn,
-        ephemeral=1,
+        rule_ephemeral=1,
+        llm_ephemeral=1,
         date_utc=just_now.isoformat(),
         date_epoch=int(just_now.timestamp()),
     )
-    policy.apply_policy(conn, cfg)
-    assert status_of(conn, msg_id) == "pending"
-
-
-def test_non_ephemeral_recent_still_blocked(conn, cfg):
-    # Same recent date but NOT ephemeral -> still blocked by the month floor.
-    msg_id = eligible_row(
-        conn,
-        ephemeral=0,
-        date_utc=RECENT_DATE.isoformat(),
-        date_epoch=int(RECENT_DATE.timestamp()),
-    )
-    policy.apply_policy(conn, cfg)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
 def test_ephemeral_waives_only_age_not_other_conditions(conn, cfg):
-    # Ephemeral waives the age floor only; attachments still block auto-trash.
     msg_id = eligible_row(
         conn,
-        ephemeral=1,
+        rule_ephemeral=1,
+        llm_ephemeral=1,
         has_attachments=1,
         date_utc=RECENT_DATE.isoformat(),
         date_epoch=int(RECENT_DATE.timestamp()),
     )
-    policy.apply_policy(conn, cfg)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
+
+
+# --- archive gate ------------------------------------------------------------------
 
 
 def archive_row(conn, *, rule_hit: bool = True, **overrides) -> int:
     """A rule-staged archive candidate that passes the auto-archive gate."""
     fields = dict(
-        staged_label="ARCHIVE_CANDIDATE",
-        proposed_action="archive",
-        classified_by="rules",
-        ai_confidence=None,
+        ruled_at=RULED,
+        rule_name="receipt",
+        rule_action="archive",
+        action="archive",
+        decision_source="rule",
+        llm_confidence=None,
     )
     fields.update(overrides)
     msg_id = insert_message(conn, **fields)
     if rule_hit:
-        add_rule_hit(conn, msg_id, "candidate", "receipt")
+        add_rule_hit(conn, msg_id, "archive", "receipt", won=True)
     return msg_id
 
 
-def test_archive_gate_approves_rule_staged_without_llm(conn, cfg):
-    # Fallback path: if classify was not run, NULL confidence still passes the
-    # gate (the COALESCE-as-full-confidence safety net).
+def test_archive_gate_approves_rule_decided_without_llm(conn, cfg):
+    # NULL confidence (rule decided alone) counts as full confidence.
     msg_id = archive_row(conn)
-    result = policy.apply_policy(conn, cfg)
+    result = policy.apply_policy(conn, params(cfg))
     assert result["auto_archived"] == 1
     assert status_of(conn, msg_id) == "auto_approved"
 
 
 def test_archive_gate_respects_llm_confidence_when_present(conn, cfg):
-    low = archive_row(conn, classified_by="llm", ai_confidence=0.5)
-    high = archive_row(conn, classified_by="llm", ai_confidence=0.85)
-    policy.apply_policy(conn, cfg)
+    low = archive_row(
+        conn, llm_action="archive", llm_confidence=0.5, decision_source="rule+llm"
+    )
+    high = archive_row(
+        conn,
+        llm_action="archive",
+        llm_confidence=0.85,
+        decision_source="rule+llm",
+        rfc_message_id="hi@x",
+    )
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, low) == "pending"
     assert status_of(conn, high) == "auto_approved"
 
 
-def test_archive_gate_requires_candidate_rule_hit(conn, cfg):
-    msg_id = archive_row(conn, rule_hit=False, classified_by="llm", ai_confidence=0.99)
-    policy.apply_policy(conn, cfg)
+def test_archive_gate_requires_rule_staged_archive(conn, cfg):
+    # Pure-LLM archive suggestion: no rule_action -> review only.
+    msg_id = insert_message(
+        conn,
+        ruled_at=RULED,
+        llm_action="archive",
+        llm_confidence=0.99,
+        action="archive",
+        decision_source="llm",
+    )
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
-def test_archive_gate_rejects_protected_messages(conn, cfg):
+def test_archive_gate_rejects_keep_hits(conn, cfg):
     msg_id = archive_row(conn)
-    add_rule_hit(conn, msg_id, "protection", "financial_legal_medical")
-    policy.apply_policy(conn, cfg)
+    add_rule_hit(conn, msg_id, "keep", "financial_legal_medical")
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
@@ -212,34 +282,37 @@ def test_archive_gate_rejects_known_contacts(conn, cfg):
         (FRIEND_ADDR,),
     )
     msg_id = archive_row(conn, from_addr=FRIEND_ADDR)
-    policy.apply_policy(conn, cfg)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "pending"
 
 
 def test_archive_gate_allows_attachments(conn, cfg):
     # Unlike trash: archiving keeps the message, so attachments don't block it.
     msg_id = archive_row(conn, has_attachments=1)
-    policy.apply_policy(conn, cfg)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "auto_approved"
 
 
 def test_archive_gate_can_be_disabled(conn, cfg):
-    # A threshold > 1 blocks LLM-scored AND rules-only (NULL confidence) rows.
-    llm_row = archive_row(conn, classified_by="llm", ai_confidence=0.99)
+    # A threshold > 1 blocks LLM-scored AND rule-only (NULL confidence) rows.
+    llm_row = archive_row(
+        conn, llm_action="archive", llm_confidence=0.99, decision_source="rule+llm"
+    )
     rules_row = archive_row(conn, rfc_message_id="r2@example.com")
-    disabled = dataclasses.replace(cfg, auto_archive_min_confidence=1.01)
-    policy.apply_policy(conn, disabled)
+    policy.apply_policy(conn, params(cfg, auto_archive_min_confidence=1.01))
     assert status_of(conn, llm_row) == "pending"
     assert status_of(conn, rules_row) == "pending"
 
 
+# --- re-running & preview -----------------------------------------------------------
+
+
 def test_rerun_demotes_on_stricter_threshold(conn, cfg):
-    msg_id = eligible_row(conn, ai_confidence=0.92)
-    policy.apply_policy(conn, cfg)
+    msg_id = eligible_row(conn, llm_confidence=0.92)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, msg_id) == "auto_approved"
 
-    stricter = dataclasses.replace(cfg, auto_trash_min_confidence=0.99)
-    policy.apply_policy(conn, stricter)
+    policy.apply_policy(conn, params(cfg, auto_trash_min_confidence=0.99))
     assert status_of(conn, msg_id) == "pending"
 
 
@@ -250,6 +323,40 @@ def test_rerun_never_touches_human_decisions(conn, cfg):
     conn.execute("UPDATE messages SET review_status='rejected' WHERE id=?", (rejected,))
     conn.commit()
 
-    policy.apply_policy(conn, cfg)
+    policy.apply_policy(conn, params(cfg))
     assert status_of(conn, approved) == "approved"
     assert status_of(conn, rejected) == "rejected"
+
+
+def test_preview_matches_apply(conn, cfg):
+    eligible_row(conn)  # passes
+    eligible_row(conn, llm_confidence=0.5, rfc_message_id="low@x")  # blocked
+    archive_row(conn, rfc_message_id="arch@x")  # passes archive
+
+    p = params(cfg)
+    preview = policy.preview_policy(conn, p)
+    result = policy.apply_policy(conn, p)
+    assert preview.trash_count == result["auto_approved"] == 1
+    assert preview.archive_count == result["auto_archived"] == 1
+    assert len(preview.trash_sample) == 1
+    assert preview.trash_sample[0]["rule_name"] == "promotional_label"
+
+
+def test_preview_counts_already_auto_approved_rows(conn, cfg):
+    # Preview after a gate run must show what a RE-run would approve (the gates
+    # demote their own approvals first), not drop to zero.
+    eligible_row(conn)
+    p = params(cfg)
+    policy.apply_policy(conn, p)
+    assert policy.preview_policy(conn, p).trash_count == 1
+
+
+def test_params_meta_roundtrip_and_precedence(conn, cfg):
+    base = policy.PolicyParams.from_config(cfg)
+    assert policy.PolicyParams.load(conn, cfg) == base  # nothing saved yet
+
+    tuned = dataclasses.replace(
+        base, auto_trash_min_confidence=0.97, auto_trash_allow_rule_only=True
+    )
+    tuned.save(conn)
+    assert policy.PolicyParams.load(conn, cfg) == tuned  # meta wins over config

@@ -5,20 +5,19 @@ from __future__ import annotations
 from ..models import (
     ACTIONABLE_ACTIONS,
     APPROVABLE_STATUSES,
-    LLM_CLASSIFIERS,
     sql_in_list,
 )
 
 MESSAGE_COLS = """
-    id, date_utc, from_addr, from_domain, subject, ai_category, ai_confidence,
-    ai_reason, staged_label, proposed_action, review_status, classified_by,
-    size_bytes, has_attachments
+    id, date_utc, from_addr, from_domain, subject, rule_name, rule_action,
+    llm_action, llm_category, llm_confidence, llm_reason, action,
+    decision_source, review_status, size_bytes, has_attachments
 """
 
 BY_SENDER = """
 SELECT from_addr, COUNT(*) AS messages,
-       SUM(CASE WHEN proposed_action='trash' THEN 1 ELSE 0 END) AS proposed_trash,
-       SUM(CASE WHEN proposed_action='archive' THEN 1 ELSE 0 END) AS proposed_archive,
+       SUM(CASE WHEN action='trash' THEN 1 ELSE 0 END) AS proposed_trash,
+       SUM(CASE WHEN action='archive' THEN 1 ELSE 0 END) AS proposed_archive,
        SUM(CASE WHEN review_status='pending' THEN 1 ELSE 0 END) AS pending,
        ROUND(SUM(size_bytes) / 1048576.0, 1) AS total_mb
 FROM messages
@@ -29,8 +28,8 @@ ORDER BY messages DESC
 
 BY_DOMAIN = """
 SELECT from_domain, COUNT(*) AS messages,
-       SUM(CASE WHEN proposed_action='trash' THEN 1 ELSE 0 END) AS proposed_trash,
-       SUM(CASE WHEN proposed_action='archive' THEN 1 ELSE 0 END) AS proposed_archive,
+       SUM(CASE WHEN action='trash' THEN 1 ELSE 0 END) AS proposed_trash,
+       SUM(CASE WHEN action='archive' THEN 1 ELSE 0 END) AS proposed_archive,
        SUM(CASE WHEN review_status='pending' THEN 1 ELSE 0 END) AS pending,
        ROUND(SUM(size_bytes) / 1048576.0, 1) AS total_mb
 FROM messages
@@ -50,12 +49,42 @@ LIMIT 100
 """
 
 STATUS_COUNTS = """
-SELECT review_status, proposed_action, COUNT(*) AS n
-FROM messages GROUP BY review_status, proposed_action ORDER BY n DESC
+SELECT review_status, action, COUNT(*) AS n
+FROM messages GROUP BY review_status, action ORDER BY n DESC
 """
 
-STAGED_COUNTS = """
-SELECT staged_label, COUNT(*) AS n FROM messages GROUP BY staged_label ORDER BY n DESC
+#: pipeline funnel: final action x who decided it
+DECISION_COUNTS = """
+SELECT COALESCE(action, '(awaiting LLM)') AS action,
+       COALESCE(decision_source, '-') AS decision_source, COUNT(*) AS n
+FROM messages WHERE ruled_at IS NOT NULL
+GROUP BY action, decision_source ORDER BY n DESC
+"""
+
+#: per-rule effectiveness for the Rules page: how often each rule matched,
+#: how often it won, and how its wins sit in the review lifecycle.
+RULE_STATS = """
+SELECT h.rule_name,
+       COUNT(*) AS hits,
+       SUM(h.won) AS wins,
+       SUM(CASE WHEN h.won=1 AND m.review_status='pending' THEN 1 ELSE 0 END)
+           AS wins_pending,
+       SUM(CASE WHEN h.won=1 AND m.review_status IN ('approved','auto_approved')
+           THEN 1 ELSE 0 END) AS wins_approved,
+       SUM(CASE WHEN h.won=1 AND m.review_status='applied' THEN 1 ELSE 0 END)
+           AS wins_applied
+FROM rule_hits h JOIN messages m ON m.id = h.message_id
+GROUP BY h.rule_name
+ORDER BY hits DESC
+"""
+
+#: rule and LLM disagree — the human-attention queue for rule tuning
+DISAGREEMENTS = f"""
+SELECT {MESSAGE_COLS}
+FROM messages
+WHERE rule_action IS NOT NULL AND llm_action IS NOT NULL
+  AND llm_action != rule_action
+ORDER BY date_epoch DESC, id DESC
 """
 
 MESSAGE_DETAIL = """
@@ -63,7 +92,7 @@ SELECT * FROM messages WHERE id = ?
 """
 
 RULE_HITS_FOR_MESSAGE = """
-SELECT rule_name, rule_kind, outcome FROM rule_hits WHERE message_id = ?
+SELECT rule_name, action, won FROM rule_hits WHERE message_id = ? ORDER BY won DESC
 """
 
 ACTIONS_FOR_MESSAGE = """
@@ -74,12 +103,13 @@ FROM actions WHERE message_id = ? ORDER BY id DESC
 # Export: the approved action table as CSV. The WHERE must stay in lockstep
 # with the runner's _SELECT_APPROVED — both build it from the same constants.
 EXPORT_ACTIONS = f"""
-SELECT gmail_msgid AS gmail_message_id, rfc_message_id, proposed_action AS action,
-       COALESCE(ai_reason, ai_category, 'rule match') AS reason, ai_confidence AS confidence,
+SELECT gmail_msgid AS gmail_message_id, rfc_message_id, action,
+       COALESCE(llm_reason, rule_name, 'rule match') AS reason,
+       llm_confidence AS confidence,
        review_status, from_addr, subject, date_utc
 FROM messages
 WHERE review_status IN ({sql_in_list(APPROVABLE_STATUSES)})
-  AND proposed_action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
+  AND action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
 ORDER BY from_domain, date_epoch
 """
 
@@ -98,15 +128,18 @@ def _message_where(filters: dict) -> tuple[str, list]:
     Every user-supplied value is BOUND (appended to ``params``); only ``?``
     placeholder counts and the hard-coded column-name literals below are ever
     interpolated — never a user string. An absent/empty filter key contributes
-    no clause (mirrors the old BY_STATUS NULL-disables convention).
+    no clause.
 
     Recognized keys (all optional):
         fts             : str        -> messages_fts MATCH
         review_status   : list[str]  -> review_status IN (...)
-        proposed_action : list[str]  -> proposed_action IN (...)
-        staged_label    : list[str]  -> staged_label IN (...)
-        ai_category     : list[str]  -> ai_category IN (...)
-        conf_lo, conf_hi: float      -> LLM-classified AND ai_confidence >=/<= ?
+        action          : list[str]  -> action IN (...)
+        decision_source : list[str]  -> decision_source IN (...)
+        rule_name       : list[str]  -> rule_name IN (...)
+        llm_category    : list[str]  -> llm_category IN (...)
+        no_rule         : bool       -> rule_name IS NULL (ruled, no match)
+        disagreement    : bool       -> llm_action != rule_action (both set)
+        conf_lo, conf_hi: float      -> LLM-classified AND llm_confidence >=/<= ?
         date_from, date_to: int      -> date_epoch >=/<= ? (unix seconds, UTC)
         from_addr       : str        -> from_addr LIKE %term%
         from_domain     : str        -> from_domain LIKE %term%
@@ -130,19 +163,28 @@ def _message_where(filters: dict) -> tuple[str, list]:
             params.extend(values)
 
     _in("review_status", filters.get("review_status"))
-    _in("proposed_action", filters.get("proposed_action"))
-    _in("staged_label", filters.get("staged_label"))
-    _in("ai_category", filters.get("ai_category"))
+    _in("action", filters.get("action"))
+    _in("decision_source", filters.get("decision_source"))
+    _in("rule_name", filters.get("rule_name"))
+    _in("llm_category", filters.get("llm_category"))
+
+    if filters.get("no_rule"):
+        where.append("ruled_at IS NOT NULL AND rule_name IS NULL")
+    if filters.get("disagreement"):
+        where.append(
+            "rule_action IS NOT NULL AND llm_action IS NOT NULL"
+            " AND llm_action != rule_action"
+        )
 
     lo, hi = filters.get("conf_lo"), filters.get("conf_hi")
     if lo is not None or hi is not None:
         # Confidence is only meaningful for LLM-classified rows.
-        where.append(f"classified_by IN ({sql_in_list(LLM_CLASSIFIERS)})")
+        where.append("llm_confidence IS NOT NULL")
         if lo is not None:
-            where.append("ai_confidence >= ?")
+            where.append("llm_confidence >= ?")
             params.append(lo)
         if hi is not None:
-            where.append("ai_confidence <= ?")
+            where.append("llm_confidence <= ?")
             params.append(hi)
 
     # Date range bounds the whole result set server-side (epoch seconds, UTC),

@@ -35,14 +35,23 @@ CREATE TABLE IF NOT EXISTS messages (
     attachment_names  TEXT,                            -- JSON array of filenames
     size_bytes        INTEGER,
     list_unsubscribe  INTEGER NOT NULL DEFAULT 0,      -- List-Unsubscribe header present
-    -- classification / decision columns
-    ephemeral         INTEGER NOT NULL DEFAULT 0,      -- timely/disposable digest: safe to trash regardless of age
-    ai_category       TEXT,
-    ai_confidence     REAL,
-    ai_reason         TEXT,
-    classified_by     TEXT,                            -- 'rules' | 'llm' | 'rules+llm'
-    staged_label      TEXT,                            -- KEEP/DELETE_CANDIDATE/ARCHIVE_CANDIDATE/UNSUBSCRIBE_CANDIDATE/NEEDS_REVIEW
-    proposed_action   TEXT,                            -- keep | archive | trash | review
+    -- rules stage (sole writer: rules/engine.py)
+    ruled_at          TEXT,                            -- set when the rules engine evaluated this row
+    rule_name         TEXT,                            -- winning rule from rules.toml (NULL = no match)
+    rule_action       TEXT,                            -- keep | archive | trash
+    rule_category     TEXT,
+    rule_protected    INTEGER NOT NULL DEFAULT 0,      -- a protect=true rule won
+    rule_ephemeral    INTEGER NOT NULL DEFAULT 0,      -- winning rule declared the message ephemeral
+    -- llm stage (sole writer: llm/classifier.py)
+    llm_action        TEXT,                            -- keep | archive | trash | review
+    llm_category      TEXT,
+    llm_confidence    REAL,
+    llm_reason        TEXT,
+    llm_ephemeral     INTEGER NOT NULL DEFAULT 0,
+    -- final decision (rules engine or classifier, whichever finalizes)
+    action            TEXT,                            -- keep | archive | trash | review; NULL = awaiting LLM
+    decision_source   TEXT,                            -- 'rule' | 'llm' | 'rule+llm'
+    -- review lifecycle (writers: policy.py, review UI, gmail/runner.py)
     review_status     TEXT NOT NULL DEFAULT 'pending', -- pending|approved|auto_approved|rejected|applied|skipped
     review_note       TEXT,
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
@@ -54,9 +63,9 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_from_domain ON messages(from_domain);
 CREATE INDEX IF NOT EXISTS idx_messages_from_addr   ON messages(from_addr);
 CREATE INDEX IF NOT EXISTS idx_messages_date_epoch  ON messages(date_epoch);
-CREATE INDEX IF NOT EXISTS idx_messages_proposed    ON messages(proposed_action);
+CREATE INDEX IF NOT EXISTS idx_messages_action      ON messages(action);
 CREATE INDEX IF NOT EXISTS idx_messages_review      ON messages(review_status);
-CREATE INDEX IF NOT EXISTS idx_messages_staged      ON messages(staged_label);
+CREATE INDEX IF NOT EXISTS idx_messages_rule        ON messages(rule_name);
 
 -- Full-text search over the message corpus (external-content table).
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -81,13 +90,15 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF subject, body_text, fro
     VALUES (new.id, new.subject, new.body_text, new.from_addr, new.from_name);
 END;
 
--- Why a message was staged the way it was: one row per rule that fired.
+-- Why a message was staged the way it was: one row per rule that matched.
+-- Every match is recorded (not just the winner); the policy gates refuse to
+-- auto-approve any message with a keep-voting hit, winner or not.
 CREATE TABLE IF NOT EXISTS rule_hits (
     id          INTEGER PRIMARY KEY,
     message_id  INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     rule_name   TEXT NOT NULL,
-    rule_kind   TEXT NOT NULL,                          -- 'protection' | 'candidate'
-    outcome     TEXT NOT NULL,                          -- staged label the rule voted for
+    action      TEXT NOT NULL,                          -- keep | archive | trash (the rule's vote)
+    won         INTEGER NOT NULL DEFAULT 0,             -- this rule decided the message
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

@@ -34,7 +34,7 @@ from ..models import (
     ACTIONABLE_ACTIONS,
     APPROVABLE_STATUSES,
     ActionStatus,
-    ProposedAction,
+    Action,
     ReviewStatus,
     sql_in_list,
 )
@@ -55,10 +55,10 @@ RETRYABLE_NETWORK_ERRORS = (OSError, http.client.HTTPException)
 # Must stay in lockstep with review.queries.EXPORT_ACTIONS — both build the
 # approved-actionable predicate from the same models constants.
 _SELECT_APPROVED = f"""
-SELECT id, gmail_msgid, rfc_message_id, from_addr, subject, date_epoch, proposed_action
+SELECT id, gmail_msgid, rfc_message_id, from_addr, subject, date_epoch, action
 FROM messages
 WHERE review_status IN ({sql_in_list(APPROVABLE_STATUSES)})
-  AND proposed_action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
+  AND action IN ({sql_in_list(ACTIONABLE_ACTIONS)})
 ORDER BY id
 """
 
@@ -314,7 +314,7 @@ def apply_actions(
 
     for row, rec, rec_err in reconciled_rows():
         stats.examined += 1
-        action = row["proposed_action"]
+        action = row["action"]
         if rec_err is not None:
             _insert_action(
                 conn,
@@ -357,7 +357,7 @@ def apply_actions(
                 progress(stats)
             continue
 
-        if action == ProposedAction.TRASH.value:
+        if action == Action.TRASH.value:
             action_id = _insert_action(
                 conn, row["id"], action, False, rec, ActionStatus.ATTEMPT.value
             )
@@ -370,7 +370,7 @@ def apply_actions(
                 _finalize_errored(conn, [(row["id"], action_id)], stats, err, progress)
                 continue
             _finalize_succeeded(conn, [(row["id"], action_id)], stats, progress)
-        elif action == ProposedAction.ARCHIVE.value:
+        elif action == Action.ARCHIVE.value:
             # Resolve the label before writing the intent row so a label
             # failure doesn't leave a dangling attempt.
             if cfg.archive_label and archive_label_id is None:
@@ -402,7 +402,7 @@ def apply_actions(
         else:
             # _SELECT_APPROVED filters to ACTIONABLE_ACTIONS; anything else
             # reaching here is a programming error, not data to act on.
-            raise ValueError(f"unexpected proposed_action {action!r}")
+            raise ValueError(f"unexpected action {action!r}")
 
     flush_archive()
     return stats

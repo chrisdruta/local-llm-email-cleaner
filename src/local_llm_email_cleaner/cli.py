@@ -12,11 +12,12 @@ import click
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
-from . import db, export, models, policy, voice_export
+from . import db, export, policy, voice_export
 from .config import Config, config_file_path, load_config, write_default_config
 from .ingest import contacts, store
 from .logging_setup import setup_logging
 from .rules import engine
+from .rules.ruleset import RulesConfigError, load_ruleset, write_default_rules
 
 
 @click.group()
@@ -54,6 +55,11 @@ def init(cfg: Config, emails: tuple[str, ...]) -> None:
         click.echo(f"Wrote {cfg_path}" + ("" if emails else " — edit user_addresses!"))
 
     cfg = load_config()  # reload in case we just created the file
+    if cfg.rules_path.exists():
+        click.echo(f"Rules file already exists: {cfg.rules_path}")
+    else:
+        write_default_rules(cfg.rules_path)
+        click.echo(f"Wrote {cfg.rules_path} — tune it, then `email-cleaner rules`.")
     for directory in (cfg.db_path.parent, cfg.credentials_path.parent):
         directory.mkdir(parents=True, exist_ok=True)
     conn = db.open_db(cfg.db_path)
@@ -125,17 +131,50 @@ def ingest(
 @click.option(
     "--reset",
     is_flag=True,
-    help="Clear previous rule/LLM results (pending rows only) and re-evaluate.",
+    help="Re-evaluate pending rows after editing rules.toml (stored LLM "
+    "verdicts are kept and re-finalized — no LLM time re-paid).",
+)
+@click.option(
+    "--full",
+    is_flag=True,
+    help="With --reset: also wipe stored LLM verdicts (true fresh start).",
+)
+@click.option("--check", is_flag=True, help="Validate the rules file and exit.")
+@click.option(
+    "--rules",
+    "rules_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Alternate rules.toml (default: [paths].rules).",
 )
 @click.pass_obj
-def rules(cfg: Config, reset: bool) -> None:
+def rules(
+    cfg: Config, reset: bool, full: bool, check: bool, rules_path: str | None
+) -> None:
     """Run the deterministic rules engine (always before classify)."""
+    path = Path(rules_path) if rules_path else cfg.rules_path
+    try:
+        ruleset = load_ruleset(path)
+    except RulesConfigError as exc:
+        raise click.ClickException(str(exc)) from None
+    enabled = ruleset.ordered_rules()
+    click.echo(f"{path}: {len(enabled)} enabled rules (of {len(ruleset.rules)}) — OK")
+    if check:
+        return
+
     conn = db.open_db(cfg.db_path)
     ctx = engine.load_context(conn)
     click.echo(f"Evaluating rules ({len(ctx.known_contacts)} known contacts) ...")
-    counts = engine.run_rules(conn, ctx, reset=reset)
-    for label, n in counts.most_common():
-        click.echo(f"  {label:24} {n}")
+    counts = engine.run_rules(conn, ruleset, ctx, reset=reset, full=full)
+    for outcome, n in counts.most_common():
+        click.echo(f"  {outcome:24} {n}")
+
+    click.echo("\nPer-rule wins:")
+    for row in conn.execute(
+        "SELECT rule_name, COUNT(*) AS n FROM messages "
+        "WHERE rule_name IS NOT NULL GROUP BY rule_name ORDER BY n DESC"
+    ):
+        click.echo(f"  {row['rule_name']:24} {row['n']}")
     conn.close()
 
 
@@ -162,7 +201,7 @@ def classify(
     batch_size: int | None,
     concurrency: int | None,
 ) -> None:
-    """Classify ambiguous + delete-candidate messages with the local LLM."""
+    """Classify with the local LLM: no-rule-match messages plus rule verdicts awaiting confirmation."""
     from .llm import chain as chain_mod
     from .llm import classifier
 
@@ -215,7 +254,11 @@ def classify(
 def policy_cmd(cfg: Config) -> None:
     """Apply the auto-trash/auto-archive policy gates (re-runnable after tuning)."""
     conn = db.open_db(cfg.db_path)
-    result = policy.apply_policy(conn, cfg)
+    params = policy.PolicyParams.load(conn, cfg)
+    click.echo("Effective policy (meta-saved values override config):")
+    for key, value in dataclasses.asdict(params).items():
+        click.echo(f"  {key} = {value}")
+    result = policy.apply_policy(conn, params)
     click.echo(f"Auto-approved for trash: {result['auto_approved']}")
     click.echo(f"Auto-approved for archive: {result['auto_archived']}")
     click.echo(
@@ -391,32 +434,34 @@ def status(cfg: Config) -> None:
     conn = db.open_db(cfg.db_path)
 
     total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    click.echo(f"Messages: {total}")
-
-    click.echo("\nStaged labels:")
-    for row in conn.execute(
-        "SELECT COALESCE(staged_label, '(not yet ruled)') AS l, COUNT(*) AS n "
-        "FROM messages GROUP BY staged_label ORDER BY n DESC"
-    ):
-        click.echo(f"  {row['l']:24} {row['n']}")
-
-    click.echo("\nReview status / proposed action:")
-    for row in conn.execute(
-        "SELECT review_status, COALESCE(proposed_action,'-') AS a, COUNT(*) AS n "
-        "FROM messages GROUP BY review_status, proposed_action ORDER BY n DESC"
-    ):
-        click.echo(f"  {row['review_status']:14} {row['a']:8} {row['n']}")
-
-    # Count exactly the population `classify` will process (shared predicate, so
-    # this can't drift): excludes voice rows and includes archive candidates.
-    unclassified = conn.execute(
-        f"SELECT COUNT(*) FROM messages WHERE {models.PENDING_CLASSIFICATION_WHERE}",
-        models.pending_classification_params(),
+    unruled = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE ruled_at IS NULL"
     ).fetchone()[0]
+    awaiting_llm = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE action IS NULL AND ruled_at IS NOT NULL"
+    ).fetchone()[0]
+    click.echo(f"Messages: {total}")
+    click.echo(f"Not yet ruled: {unruled}")
+    click.echo(f"Awaiting LLM classification: {awaiting_llm}")
+
+    click.echo("\nFinal action / decided by:")
+    for row in conn.execute(
+        "SELECT COALESCE(action, '(undecided)') AS a, "
+        "COALESCE(decision_source, '-') AS src, COUNT(*) AS n "
+        "FROM messages GROUP BY action, decision_source ORDER BY n DESC"
+    ):
+        click.echo(f"  {row['a']:12} {row['src']:10} {row['n']}")
+
+    click.echo("\nReview status / action:")
+    for row in conn.execute(
+        "SELECT review_status, COALESCE(action,'-') AS a, COUNT(*) AS n "
+        "FROM messages GROUP BY review_status, action ORDER BY n DESC"
+    ):
+        click.echo(f"  {row['review_status']:14} {row['a']:12} {row['n']}")
+
     n_contacts = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
     n_actions = conn.execute("SELECT COUNT(*) FROM actions").fetchone()[0]
-    click.echo(f"\nAwaiting LLM classification: {unclassified}")
-    click.echo(f"Known contacts: {n_contacts};  audit log rows: {n_actions}")
+    click.echo(f"\nKnown contacts: {n_contacts};  audit log rows: {n_actions}")
     conn.close()
 
 

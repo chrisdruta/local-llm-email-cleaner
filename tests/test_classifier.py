@@ -1,4 +1,4 @@
-"""LLM classifier: routing, second-opinion semantics, failure handling,
+"""LLM classifier: selection, agree/disagree finalization, failure handling,
 resume, and concurrent fan-out."""
 
 from __future__ import annotations
@@ -10,11 +10,13 @@ import threading
 import pytest
 from langchain_core.runnables import RunnableLambda
 
-from conftest import add_rule_hit, insert_message
+from conftest import insert_message
 
 from local_llm_email_cleaner.config import DEFAULTS
 from local_llm_email_cleaner.llm import classifier
 from local_llm_email_cleaner.llm.schema import EmailClassification
+
+RULED = "2026-01-01T00:00:00"
 
 
 def fake_chain(
@@ -39,278 +41,144 @@ def row_of(conn, msg_id):
     return conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
 
 
-def test_ambiguous_row_gets_llm_label(conn, cfg):
-    msg_id = insert_message(conn, staged_label="NEEDS_REVIEW", proposed_action="review")
-    stats = classifier.classify_messages(conn, cfg, fake_chain())
-    assert stats.processed == 1
-
-    row = row_of(conn, msg_id)
-    assert row["staged_label"] == "DELETE_CANDIDATE"
-    assert row["proposed_action"] == "trash"
-    assert row["classified_by"] == "llm"
-    assert row["ai_confidence"] == 0.97
-    assert row["ai_reason"] == "old promo"
+def no_rule_row(conn, **overrides) -> int:
+    """Ruled, nothing matched: the LLM is the primary classifier."""
+    return insert_message(conn, ruled_at=RULED, **overrides)
 
 
-def test_delete_candidate_confirmed_by_llm(conn, cfg):
-    msg_id = insert_message(
+def rule_staged_row(conn, rule_action="trash", **overrides) -> int:
+    """Ruled by a confirm_with_llm rule: awaiting the LLM's second opinion."""
+    return insert_message(
         conn,
-        staged_label="DELETE_CANDIDATE",
-        proposed_action="trash",
-        classified_by="rules",
-    )
-    classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
-    row = row_of(conn, msg_id)
-    assert row["staged_label"] == "DELETE_CANDIDATE"
-    assert row["classified_by"] == "rules+llm"
-
-
-def test_delete_candidate_llm_disagreement_demotes_to_review(conn, cfg):
-    msg_id = insert_message(
-        conn,
-        staged_label="DELETE_CANDIDATE",
-        proposed_action="trash",
-        classified_by="rules",
-    )
-    classifier.classify_messages(conn, cfg, fake_chain(action="keep", confidence=0.8))
-    row = row_of(conn, msg_id)
-    assert row["staged_label"] == "NEEDS_REVIEW"
-    assert row["proposed_action"] == "review"
-    assert row["classified_by"] == "rules+llm"
-
-
-def test_keep_without_protection_hit_not_selected(conn, cfg):
-    # A KEEP with no protection rule_hit (a degenerate state) is not double-
-    # checked — only keyword-protected KEEPs are.
-    insert_message(
-        conn, staged_label="KEEP", proposed_action="keep", classified_by="rules"
-    )
-    stats = classifier.classify_messages(conn, cfg, fake_chain())
-    assert stats.processed == 0
-
-
-def keyword_keep(conn, **overrides) -> int:
-    """A KEEP staged by a keyword protection rule (financial/security)."""
-    msg_id = insert_message(
-        conn,
-        staged_label="KEEP",
-        proposed_action="keep",
-        ai_category="financial_legal_medical",
-        classified_by="rules",
+        ruled_at=RULED,
+        rule_name="promotional_label",
+        rule_action=rule_action,
+        rule_category="promotion",
         **overrides,
     )
-    add_rule_hit(conn, msg_id, "protection", "financial_legal_medical")
-    return msg_id
 
 
-def test_keyword_protected_keep_is_double_checked_and_downgraded(conn, cfg):
-    # The keyword rule over-matched a promo footer; the LLM calls it junk and
-    # pulls it down to a delete candidate for human review.
-    msg_id = keyword_keep(conn)
-    stats = classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
+# --- selection -------------------------------------------------------------------
+
+
+def test_unruled_rows_not_selected(conn, cfg):
+    insert_message(conn)  # ruled_at NULL: rules haven't run yet
+    assert classifier.classify_messages(conn, cfg, fake_chain()).processed == 0
+
+
+def test_finalized_rows_not_selected(conn, cfg):
+    # A rule that decided alone (e.g. voice, or any confirm_with_llm=false).
+    insert_message(
+        conn,
+        ruled_at=RULED,
+        rule_name="voice",
+        rule_action="trash",
+        action="trash",
+        decision_source="rule",
+    )
+    assert classifier.classify_messages(conn, cfg, fake_chain()).processed == 0
+
+
+def test_selection_is_action_null_and_ruled(conn, cfg):
+    no_rule_row(conn)
+    rule_staged_row(conn, rfc_message_id="staged@x")
+
+    def awaiting() -> int:
+        return conn.execute(
+            "SELECT COUNT(*) FROM messages "
+            "WHERE action IS NULL AND ruled_at IS NOT NULL"
+        ).fetchone()[0]
+
+    assert awaiting() == 2
+    assert classifier.classify_messages(conn, cfg, fake_chain()).processed == 2
+    assert awaiting() == 0  # nothing lingers
+
+
+# --- finalization ----------------------------------------------------------------
+
+
+def test_no_rule_match_takes_llm_action(conn, cfg):
+    msg_id = no_rule_row(conn)
+    stats = classifier.classify_messages(conn, cfg, fake_chain())
     assert stats.processed == 1
+
     row = row_of(conn, msg_id)
-    assert row["staged_label"] == "DELETE_CANDIDATE"
-    assert row["proposed_action"] == "trash"
-    assert row["classified_by"] == "rules+llm"
-    assert row["ai_confidence"] == 0.97
+    assert row["llm_action"] == "trash"
+    assert row["llm_category"] == "promotion"
+    assert row["llm_confidence"] == 0.97
+    assert row["llm_reason"] == "old promo"
+    assert row["action"] == "trash"
+    assert row["decision_source"] == "llm"
 
 
-def test_keyword_protected_keep_downgraded_to_archive(conn, cfg):
-    msg_id = keyword_keep(conn)
-    classifier.classify_messages(conn, cfg, fake_chain(action="archive"))
+def test_rule_confirmed_by_llm(conn, cfg):
+    msg_id = rule_staged_row(conn, rule_action="trash")
+    classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
     row = row_of(conn, msg_id)
-    assert row["staged_label"] == "ARCHIVE_CANDIDATE"
-    assert row["proposed_action"] == "archive"
+    assert row["action"] == "trash"
+    assert row["decision_source"] == "rule+llm"
 
 
-def test_keyword_protected_keep_confirmed_stays_kept(conn, cfg):
-    # The LLM agrees it's genuinely sensitive: it stays KEEP, now with a verdict.
-    msg_id = keyword_keep(conn)
+def test_rule_disagreement_routes_to_review(conn, cfg):
+    msg_id = rule_staged_row(conn, rule_action="trash")
+    classifier.classify_messages(conn, cfg, fake_chain(action="keep", confidence=0.8))
+    row = row_of(conn, msg_id)
+    assert row["llm_action"] == "keep"  # the verdict is recorded verbatim
+    assert row["action"] == "review"  # but a human decides
+    assert row["decision_source"] == "rule+llm"
+
+
+def test_archive_rule_llm_trash_is_disagreement(conn, cfg):
+    # v3 is strict: no archive->trash escalation; any mismatch goes to review.
+    msg_id = rule_staged_row(conn, rule_action="archive")
+    classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
+    row = row_of(conn, msg_id)
+    assert row["action"] == "review"
+    assert row["decision_source"] == "rule+llm"
+
+
+def test_keep_rule_confirmed_stays_kept(conn, cfg):
+    # A keyword keep (confirm_with_llm) the LLM agrees with.
+    msg_id = rule_staged_row(conn, rule_action="keep")
     classifier.classify_messages(
         conn, cfg, fake_chain(action="keep", category="financial_legal_medical")
     )
     row = row_of(conn, msg_id)
-    assert row["staged_label"] == "KEEP"
-    assert row["proposed_action"] == "keep"
-    assert row["classified_by"] == "rules+llm"
+    assert row["action"] == "keep"
+    assert row["decision_source"] == "rule+llm"
 
 
-def test_keyword_protected_keep_review_verdict_demotes(conn, cfg):
-    # KEEP accepts every verdict (like a primary NEEDS_REVIEW row); a 'review'
-    # verdict simply routes it to a human.
-    msg_id = keyword_keep(conn)
-    classifier.classify_messages(conn, cfg, fake_chain(action="review"))
+def test_keep_rule_llm_trash_routes_to_review(conn, cfg):
+    # The keyword rule over-matched a promo footer; the LLM calls it junk.
+    # v3 routes the dispute to a human instead of directly downgrading.
+    msg_id = rule_staged_row(conn, rule_action="keep")
+    classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
     row = row_of(conn, msg_id)
-    assert row["staged_label"] == "NEEDS_REVIEW"
-    assert row["proposed_action"] == "review"
-    assert row["classified_by"] == "rules+llm"
+    assert row["llm_action"] == "trash"
+    assert row["action"] == "review"
 
 
-def test_known_contact_keep_not_double_checked(conn, cfg):
-    # The one absolute protection: a known-contact KEEP is never reviewed down.
-    msg_id = insert_message(
-        conn, staged_label="KEEP", proposed_action="keep", classified_by="rules"
-    )
-    add_rule_hit(conn, msg_id, "protection", "known_contact")
-    stats = classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
-    assert stats.processed == 0
-    assert row_of(conn, msg_id)["staged_label"] == "KEEP"
-
-
-def test_keep_with_both_known_contact_and_keyword_not_selected(conn, cfg):
-    # Known-contact protection is absolute even when a keyword rule also fired.
-    msg_id = keyword_keep(conn)
-    add_rule_hit(conn, msg_id, "protection", "known_contact")
-    stats = classifier.classify_messages(conn, cfg, fake_chain(action="trash"))
-    assert stats.processed == 0
-    assert row_of(conn, msg_id)["staged_label"] == "KEEP"
-
-
-def test_voice_delete_candidates_not_selected(conn, cfg):
-    # The `voice` rule stages these DELETE_CANDIDATE but tags them 'voice'
-    # (backed up to disk); the LLM can't meaningfully judge a text message, so
-    # the classifier must skip them. A rules-staged delete candidate still runs.
-    insert_message(
-        conn,
-        staged_label="DELETE_CANDIDATE",
-        proposed_action="trash",
-        classified_by="voice",
-    )
-    rule_id = insert_message(
-        conn,
-        staged_label="DELETE_CANDIDATE",
-        proposed_action="trash",
-        classified_by="rules",
-    )
-    stats = classifier.classify_messages(conn, cfg, fake_chain())
-    assert stats.processed == 1
-    assert row_of(conn, rule_id)["classified_by"] == "rules+llm"
-
-
-def archive_candidate(conn, **overrides) -> int:
-    fields = dict(
-        staged_label="ARCHIVE_CANDIDATE",
-        proposed_action="archive",
-        classified_by="rules",
-    )
-    fields.update(overrides)
-    return insert_message(conn, **fields)
-
-
-def test_archive_candidate_confirmed_by_llm(conn, cfg):
-    # LLM agrees it's archive-worthy: stays archive, now with a confidence.
-    msg_id = archive_candidate(conn)
-    classifier.classify_messages(
-        conn, cfg, fake_chain(action="archive", confidence=0.85)
-    )
+def test_llm_review_verdict_stands_for_no_rule_rows(conn, cfg):
+    msg_id = no_rule_row(conn)
+    classifier.classify_messages(conn, cfg, fake_chain(action="review", confidence=0.4))
     row = row_of(conn, msg_id)
-    assert row["staged_label"] == "ARCHIVE_CANDIDATE"
-    assert row["proposed_action"] == "archive"
-    assert row["classified_by"] == "rules+llm"
-    assert row["ai_confidence"] == 0.85
+    assert row["action"] == "review"
+    assert row["decision_source"] == "llm"
 
 
-def test_archive_candidate_escalated_to_trash_by_llm(conn, cfg):
-    # LLM thinks it's outright junk: hand it to the auto-trash gate.
-    msg_id = archive_candidate(conn)
-    classifier.classify_messages(conn, cfg, fake_chain(action="trash", confidence=0.97))
-    row = row_of(conn, msg_id)
-    assert row["staged_label"] == "DELETE_CANDIDATE"
-    assert row["proposed_action"] == "trash"
-    assert row["classified_by"] == "rules+llm"
-
-
-def test_archive_candidate_llm_disagreement_demotes_to_review(conn, cfg):
-    # LLM says keep: conservative -> human review.
-    msg_id = archive_candidate(conn)
-    classifier.classify_messages(conn, cfg, fake_chain(action="keep", confidence=0.7))
-    row = row_of(conn, msg_id)
-    assert row["staged_label"] == "NEEDS_REVIEW"
-    assert row["proposed_action"] == "review"
-    assert row["classified_by"] == "rules+llm"
-
-
-def test_llm_alone_cannot_set_ephemeral(conn, cfg):
-    # The age-floor waiver requires BOTH signals. This row never hit the
-    # deterministic `digest` rule (ephemeral starts 0), so even when the LLM
-    # escalates to trash and claims ephemeral, the flag must stay 0 — the LLM
-    # alone may not waive the 12-month floor.
-    msg_id = archive_candidate(conn)
+def test_llm_ephemeral_recorded_verbatim(conn, cfg):
+    # The AND-semantics live in the policy gate (rule_ephemeral AND
+    # llm_ephemeral); the classifier just records the LLM's own judgment.
+    msg_id = rule_staged_row(conn, rule_action="trash")
     classifier.classify_messages(
         conn, cfg, fake_chain(action="trash", category="digest", ephemeral=True)
     )
     row = row_of(conn, msg_id)
-    assert row["staged_label"] == "DELETE_CANDIDATE"
-    assert row["proposed_action"] == "trash"
-    assert row["ephemeral"] == 0
+    assert row["llm_ephemeral"] == 1
+    assert row["rule_ephemeral"] == 0  # untouched — owned by the rules stage
 
 
-def test_ephemeral_requires_llm_confirmation(conn, cfg):
-    # The digest rule flagged this ephemeral, but the LLM second opinion does
-    # NOT consider it ephemeral: require-both -> the flag is cleared, so it
-    # falls back to the normal age floor.
-    msg_id = insert_message(
-        conn,
-        staged_label="DELETE_CANDIDATE",
-        proposed_action="trash",
-        classified_by="rules",
-        ephemeral=1,
-    )
-    classifier.classify_messages(conn, cfg, fake_chain(action="trash", ephemeral=False))
-    assert row_of(conn, msg_id)["ephemeral"] == 0
-
-
-def test_ephemeral_set_only_when_both_agree(conn, cfg):
-    # Digest rule set ephemeral AND the LLM confirms it -> the waiver applies.
-    msg_id = insert_message(
-        conn,
-        staged_label="DELETE_CANDIDATE",
-        proposed_action="trash",
-        classified_by="rules",
-        ephemeral=1,
-    )
-    classifier.classify_messages(conn, cfg, fake_chain(action="trash", ephemeral=True))
-    assert row_of(conn, msg_id)["ephemeral"] == 1
-
-
-def test_non_ephemeral_classification_leaves_flag_zero(conn, cfg):
-    msg_id = insert_message(conn, staged_label="NEEDS_REVIEW", proposed_action="review")
-    classifier.classify_messages(conn, cfg, fake_chain(ephemeral=False))
-    assert row_of(conn, msg_id)["ephemeral"] == 0
-
-
-def test_pending_predicate_matches_what_classify_processes(conn, cfg):
-    """status counts the SAME population classify selects: voice excluded,
-    archive candidates included, and it reads 0 after a full run."""
-    from local_llm_email_cleaner import models
-
-    insert_message(conn, staged_label="NEEDS_REVIEW", proposed_action="review")
-    insert_message(
-        conn,
-        staged_label="ARCHIVE_CANDIDATE",
-        proposed_action="archive",
-        classified_by="rules",
-        rfc_message_id="arch@x",
-    )
-    insert_message(
-        conn,
-        staged_label="DELETE_CANDIDATE",
-        proposed_action="trash",
-        classified_by="voice",  # decided by the export -> never sent to the LLM
-        rfc_message_id="voice@x",
-    )
-
-    def pending_count() -> int:
-        return conn.execute(
-            f"SELECT COUNT(*) FROM messages WHERE {models.PENDING_CLASSIFICATION_WHERE}",
-            models.pending_classification_params(),
-        ).fetchone()[0]
-
-    assert pending_count() == 2  # the review + archive rows, NOT the voice row
-    stats = classifier.classify_messages(conn, cfg, fake_chain(action="archive"))
-    assert stats.processed == 2
-    assert pending_count() == 0  # nothing lingers (the voice row never counted)
+# --- plumbing ---------------------------------------------------------------------
 
 
 def test_chain_passes_request_timeout(monkeypatch):
@@ -348,18 +216,18 @@ def test_failure_marks_row_for_human_review(conn, cfg, monkeypatch):
     def boom(_inputs):
         raise RuntimeError("ollama exploded")
 
-    msg_id = insert_message(conn, staged_label="NEEDS_REVIEW", proposed_action="review")
+    msg_id = no_rule_row(conn)
     stats = classifier.classify_messages(conn, cfg, RunnableLambda(boom))
     assert stats.failed == 1
 
     row = row_of(conn, msg_id)
-    assert row["staged_label"] == "NEEDS_REVIEW"
-    assert row["ai_confidence"] == 0.0
-    assert "classification failed" in row["ai_reason"]
+    assert row["action"] == "review"
+    assert row["llm_confidence"] == 0.0
+    assert "classification failed" in row["llm_reason"]
 
 
 def test_resume_skips_already_classified(conn, cfg):
-    insert_message(conn, staged_label="NEEDS_REVIEW", proposed_action="review")
+    no_rule_row(conn)
     assert classifier.classify_messages(conn, cfg, fake_chain()).processed == 1
     # Second run finds nothing left to do.
     assert classifier.classify_messages(conn, cfg, fake_chain()).processed == 0
@@ -377,11 +245,11 @@ def test_transient_failure_recovers_on_retry(conn, cfg, monkeypatch):
             action="trash", category="promotion", confidence=0.95, reason="junk"
         )
 
-    msg_id = insert_message(conn, staged_label="NEEDS_REVIEW", proposed_action="review")
+    msg_id = no_rule_row(conn)
     stats = classifier.classify_messages(conn, cfg, RunnableLambda(flaky))
     assert stats.processed == 1
     assert stats.failed == 0
-    assert row_of(conn, msg_id)["ai_confidence"] == 0.95
+    assert row_of(conn, msg_id)["llm_confidence"] == 0.95
 
 
 def test_mixed_batch_isolates_failures(conn, cfg, monkeypatch):
@@ -394,23 +262,15 @@ def test_mixed_batch_isolates_failures(conn, cfg, monkeypatch):
             action="trash", category="promotion", confidence=0.95, reason="junk"
         )
 
-    good_id = insert_message(
-        conn, staged_label="NEEDS_REVIEW", proposed_action="review", subject="good"
-    )
-    bad_id = insert_message(
-        conn,
-        staged_label="NEEDS_REVIEW",
-        proposed_action="review",
-        subject="bad",
-        rfc_message_id="bad@x",
-    )
+    good_id = no_rule_row(conn, subject="good")
+    bad_id = no_rule_row(conn, subject="bad", rfc_message_id="bad@x")
     stats = classifier.classify_messages(conn, cfg, RunnableLambda(per_subject))
     assert stats.processed == 1
     assert stats.failed == 1
-    assert row_of(conn, good_id)["staged_label"] == "DELETE_CANDIDATE"
+    assert row_of(conn, good_id)["action"] == "trash"
     bad_row = row_of(conn, bad_id)
-    assert bad_row["staged_label"] == "NEEDS_REVIEW"
-    assert bad_row["ai_confidence"] == 0.0
+    assert bad_row["action"] == "review"
+    assert bad_row["llm_confidence"] == 0.0
 
 
 def test_requests_run_concurrently(conn, cfg):
@@ -424,13 +284,8 @@ def test_requests_run_concurrently(conn, cfg):
             action="trash", category="promotion", confidence=0.95, reason="junk"
         )
 
-    insert_message(conn, staged_label="NEEDS_REVIEW", proposed_action="review")
-    insert_message(
-        conn,
-        staged_label="NEEDS_REVIEW",
-        proposed_action="review",
-        rfc_message_id="b@x",
-    )
+    no_rule_row(conn)
+    no_rule_row(conn, rfc_message_id="b@x")
     cfg = dataclasses.replace(cfg, llm_concurrency=2)
     stats = classifier.classify_messages(conn, cfg, RunnableLambda(rendezvous))
     assert stats.processed == 2
@@ -448,12 +303,7 @@ def test_commits_per_chunk(conn, cfg, monkeypatch):
 
     monkeypatch.setattr(classifier, "_batch_with_retry", spy)
     for i in range(3):
-        insert_message(
-            conn,
-            staged_label="NEEDS_REVIEW",
-            proposed_action="review",
-            rfc_message_id=f"m{i}@x",
-        )
+        no_rule_row(conn, rfc_message_id=f"m{i}@x")
     cfg = dataclasses.replace(cfg, llm_batch_size=2)
     stats = classifier.classify_messages(
         conn,
@@ -474,16 +324,8 @@ def test_interrupt_commits_finished_work_and_drops_the_rest(conn, cfg):
             action="trash", category="promotion", confidence=0.95, reason="junk"
         )
 
-    done_id = insert_message(
-        conn, staged_label="NEEDS_REVIEW", proposed_action="review", subject="ok"
-    )
-    hit_id = insert_message(
-        conn,
-        staged_label="NEEDS_REVIEW",
-        proposed_action="review",
-        subject="interrupt",
-        rfc_message_id="int@x",
-    )
+    done_id = no_rule_row(conn, subject="ok")
+    hit_id = no_rule_row(conn, subject="interrupt", rfc_message_id="int@x")
     cfg = dataclasses.replace(cfg, llm_concurrency=1)  # deterministic order
     with pytest.raises(KeyboardInterrupt):
         classifier.classify_messages(conn, cfg, RunnableLambda(per_subject))
@@ -494,22 +336,17 @@ def test_interrupt_commits_finished_work_and_drops_the_rest(conn, cfg):
     done_row = other.execute("SELECT * FROM messages WHERE id=?", (done_id,)).fetchone()
     hit_row = other.execute("SELECT * FROM messages WHERE id=?", (hit_id,)).fetchone()
     other.close()
-    assert done_row["ai_confidence"] == 0.95
-    assert done_row["staged_label"] == "DELETE_CANDIDATE"
+    assert done_row["llm_confidence"] == 0.95
+    assert done_row["action"] == "trash"
     # ... and the interrupted row is untouched, so the next run picks it up.
-    assert hit_row["ai_confidence"] is None
-    assert hit_row["staged_label"] == "NEEDS_REVIEW"
+    assert hit_row["llm_confidence"] is None
+    assert hit_row["action"] is None
 
 
 def test_progress_ticks_per_message(conn, cfg):
     """progress fires per finalized message, not per batch chunk."""
     for i in range(3):
-        insert_message(
-            conn,
-            staged_label="NEEDS_REVIEW",
-            proposed_action="review",
-            rfc_message_id=f"p{i}@x",
-        )
+        no_rule_row(conn, rfc_message_id=f"p{i}@x")
     seen = []
     classifier.classify_messages(
         conn,
@@ -528,7 +365,7 @@ def test_progress_counts_failures_once(conn, cfg, monkeypatch):
     def boom(_inputs):
         raise RuntimeError("ollama exploded")
 
-    insert_message(conn, staged_label="NEEDS_REVIEW", proposed_action="review")
+    no_rule_row(conn)
     seen = []
     stats = classifier.classify_messages(
         conn,
