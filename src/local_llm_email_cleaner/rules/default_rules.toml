@@ -1,0 +1,214 @@
+# Deterministic staging rules for local-llm-email-cleaner.
+#
+# Evaluation: every enabled rule is tested against every message; ALL matches
+# are recorded (they feed the policy gates and the UI), and the single rule
+# with the highest `priority` wins (ties broken by file order). The winner's
+# `action` becomes the message's staged verdict:
+#
+#   - protect = true        absolute keep: decided here, never sent to the LLM,
+#                           and ANY keep-voting match (winner or not) blocks
+#                           auto-approval downstream — human review only.
+#   - confirm_with_llm      tentative: the LLM classifies the message blind
+#                           (it never sees the rule's verdict). Agreement
+#                           confirms the action; disagreement routes the
+#                           message to human review.
+#   - confirm_with_llm = false   the rule decides alone; the LLM is skipped.
+#   - ephemeral = true      timely/disposable mail (digests): the auto-trash
+#                           gate may waive its age floor when the LLM also
+#                           flags the message ephemeral.
+#
+# A message matching NO rule goes straight to the LLM for a suggested action.
+#
+# Match blocks: a rule may have several `[[rules.match]]` blocks — they OR
+# together; criteria inside one block AND together. Available criteria:
+#   from_addr        = ["exact@addr", ...]     (lowercased exact match)
+#   from_addr_regex  = '...'                   (case-insensitive, searched)
+#   from_domain      = ["example.com", ...]
+#   subject_regex    = '...'
+#   body_regex       = '...'
+#   gmail_labels     = ["spam", ...]           (any-of, lowercased)
+#   list_unsubscribe = true                    (has a List-Unsubscribe header)
+#   has_attachments  = true / false
+#   known_contact    = true                    (sender derived from your Sent mail)
+#
+# Use single-quoted TOML strings for regexes so backslashes survive ('\b...').
+# Keep patterns simple — a catastrophic-backtracking regex can stall the run
+# on long bodies. Validate edits with:  uv run email-cleaner rules --check
+#
+# Priority conventions in this file: voice 1000 > known_contact 900 >
+# spam 300 > keep-keywords 250 > digest 200 > archive rules 140-150 >
+# ordinary trash rules 100.
+
+version = 1
+
+# --- synthetic records (decided by rules alone) ------------------------------
+
+[[rules]]
+name = "voice"
+description = "Google Voice SMS/call-log/voicemail record — backed up to disk by voice-export, then staged for trash (the LLM never judges it)."
+# Above known_contact: outbound-SMS copies can leak the recipient's number into
+# the derived contacts, which would otherwise shield these converter artifacts
+# from cleanup. Never auto-approved (no LLM confidence) — approve in review
+# after running voice-export.
+priority = 1000
+action = "trash"
+category = "voice"
+confirm_with_llm = false
+[[rules.match]]
+gmail_labels = ["sms", "call log", "voicemail"]
+
+# --- protection --------------------------------------------------------------
+
+[[rules]]
+name = "known_contact"
+description = "Sender is in your derived contacts (you've emailed them) — always kept."
+priority = 900
+protect = true
+category = "personal"
+[[rules.match]]
+known_contact = true
+
+[[rules]]
+name = "spam_label"
+description = "Gmail's own filter already flagged it as Spam."
+# Outranks the keyword keeps below: scam bait imitates exactly those financial/
+# security subjects. A keyword match still blocks auto-approval (keep-voting
+# hit), so spam that smells financial always reaches a human.
+priority = 300
+action = "trash"
+category = "spam"
+confirm_with_llm = true
+[[rules.match]]
+gmail_labels = ["spam"]
+
+[[rules]]
+name = "financial_legal_medical"
+description = "Subject or body matches financial/legal/medical terms — kept as a potentially important record."
+# The subject pattern is broad (a sensitive subject is rarely an accident); the
+# body pattern is a strict subset — bare tokens like "legal" or "insurance"
+# live in the footer of nearly every promo. The LLM double-checks these keeps
+# because the patterns still over-match; a disagreement goes to human review.
+priority = 250
+action = "keep"
+category = "financial_legal_medical"
+confirm_with_llm = true
+[[rules.match]]
+subject_regex = '\b(?:tax(?:es)?\b|\birs\b|w-?2\b|1099|account\s+statement|bank\s+statement|insurance|policy\s+(?:number|renewal|document)|claim\s+(?:status|number)|legal|lawyer|attorney|contract|lease|deed|notary|medical|doctor|prescription|pharmacy|lab\s+result|diagnosis|appointment\s+(?:confirmed|reminder)|mortgage|loan|payroll|salary|benefits|401\s?k|\bhsa\b|\bfsa\b)'
+[[rules.match]]
+body_regex = '\b(?:tax\s+(?:return|document|form)|\birs\b|w-?2\b|1099|account\s+statement|bank\s+statement|mortgage\s+statement|policy\s+(?:number|renewal|document)|claim\s+(?:status|number)|explanation\s+of\s+benefits|lab\s+result|diagnosis|prescription|loan\s+(?:application|statement|agreement)|payroll|401\s?k|\bhsa\b|\bfsa\b)'
+
+[[rules]]
+name = "security_alert"
+description = "Looks like an account-security notification — kept."
+# Same broad-subject / strict-body split as financial_legal_medical: the body
+# pattern drops marketing CTAs (a bare "reset your password") and keeps
+# past-tense notifications and one-time codes.
+priority = 250
+action = "keep"
+category = "security"
+confirm_with_llm = true
+[[rules.match]]
+subject_regex = '\b(?:security\s+alert|sign[\-\s]?in\s+(?:attempt|detected|from)|new\s+device|password\s+(?:was\s+)?(?:changed|reset)|reset\s+your\s+password|verification\s+code|one[\-\s]?time\s+(?:pass(?:word|code)?|pin)|\botp\b|two[\-\s]?factor|\b2fa\b|login\s+attempt|suspicious\s+activity)'
+[[rules.match]]
+body_regex = '\b(?:security\s+alert|sign[\-\s]?in\s+(?:attempt|detected|from)|password\s+was\s+(?:changed|reset)|verification\s+code|one[\-\s]?time\s+(?:pass(?:word|code)?|pin)|\botp\b|two[\-\s]?factor|\b2fa\b|login\s+attempt|suspicious\s+activity)'
+[[rules.match]]
+from_addr_regex = '^(?:security|account-security|no-reply@accounts)'
+
+# --- cleanup candidates (LLM double-checks each) ------------------------------
+
+[[rules]]
+name = "digest"
+description = "Timely, recurring digest/roundup — disposable once its day passes (may skip the age floor when the LLM agrees)."
+priority = 200
+action = "trash"
+category = "digest"
+confirm_with_llm = true
+ephemeral = true
+[[rules.match]]
+from_addr_regex = '@(?:redditmail\.com|e?mail\.nextdoor\.com|.*\.substack\.com)$'
+[[rules.match]]
+subject_regex = '''\b(?:daily|weekly|monthly)\s+(?:digest|roundup|recap|briefing|newsletter)\b|\bdigest\b|\btop\s+(?:posts|stories)\b|\b\d+\s+new\s+(?:posts|stories|notifications|messages|replies)\b|\bwhat'?s\s+(?:new|happening|trending)\b|\bhighlights?\s+(?:for\s+you|this\s+week)\b'''
+
+[[rules]]
+name = "receipt"
+description = "Subject looks like a receipt/order confirmation — archived, not trashed."
+# Archive rules sit above the trash rules so a receipt that also carries the
+# Promotions label is archived, not trashed (the conservative outcome wins).
+priority = 150
+action = "archive"
+category = "receipt"
+confirm_with_llm = true
+[[rules.match]]
+subject_regex = '\b(?:receipt|order\s+confirmation|payment\s+(?:received|confirmation)|invoice\s+#?\d)'
+
+[[rules]]
+name = "updates_label"
+description = "Carries Gmail's Updates/Forums category — archived."
+priority = 140
+action = "archive"
+category = "notification"
+confirm_with_llm = true
+[[rules.match]]
+gmail_labels = ["category updates", "updates", "category forums", "forums"]
+
+[[rules]]
+name = "shipping"
+description = "Shipping/delivery notification — disposable clutter."
+priority = 100
+action = "trash"
+category = "shipping"
+confirm_with_llm = true
+[[rules.match]]
+subject_regex = '\b(?:has\s+shipped|shipping\s+confirmation|out\s+for\s+delivery|was\s+delivered|tracking\s+number|on\s+its\s+way|delivery\s+update)'
+
+[[rules]]
+name = "calendar"
+description = "Calendar invitation or update — disposable once past."
+priority = 100
+action = "trash"
+category = "calendar"
+confirm_with_llm = true
+[[rules.match]]
+subject_regex = '^(?:invitation:|accepted:|declined:|tentative:|updated\s+invitation:|canceled(?:\s+event)?:|reminder:)'
+
+[[rules]]
+name = "promotional_label"
+description = "Carries Gmail's Promotions category — marketing mail."
+priority = 100
+action = "trash"
+category = "promotion"
+confirm_with_llm = true
+[[rules.match]]
+gmail_labels = ["category promotions", "promotions"]
+
+[[rules]]
+name = "social_label"
+description = "Carries Gmail's Social category — social-network noise."
+priority = 100
+action = "trash"
+category = "social"
+confirm_with_llm = true
+[[rules.match]]
+gmail_labels = ["category social", "social"]
+
+[[rules]]
+name = "noreply_sender"
+description = "Sent from a no-reply / automated address."
+priority = 100
+action = "trash"
+category = "automated"
+confirm_with_llm = true
+[[rules.match]]
+from_addr_regex = '(?:^|[.\-_@])(?:no[\-_.]?reply|do[\-_.]?not[\-_.]?reply|donotreply|mailer-daemon)'
+
+# Newsletters with a List-Unsubscribe header used to be staged as a separate
+# class; now they simply go to the LLM unless you enable something like this:
+# [[rules]]
+# name = "newsletter_unsubscribe"
+# description = "Has a List-Unsubscribe header — a newsletter."
+# priority = 90
+# action = "archive"
+# confirm_with_llm = true
+# category = "newsletter"
+# [[rules.match]]
+# list_unsubscribe = true
