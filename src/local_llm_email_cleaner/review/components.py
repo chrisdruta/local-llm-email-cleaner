@@ -85,6 +85,7 @@ MESSAGE_COLUMN_ORDER = [
     "action",
     "review_status",
     "rule_name",
+    "rule_action",
     "llm_action",
     "llm_confidence",
     "decision_source",
